@@ -1,0 +1,7 @@
+event_id,event_type,event_timestamp,program_id,middleware_txn_id,end_user_id,bank_account_id,amount,direction,customer_balance,heartbeat_status
+TIM-001,HEARTBEAT,2026-10-21T13:00:00,PROG-001,,,,,,,OK
+TIM-002,TRANSACTION,2026-10-21T13:00:30,PROG-001,LATE-1001,U001,FBO-001,700.00,CREDIT,4700.00,
+TIM-003,HEARTBEAT,2026-10-21T13:02:00,PROG-001,,,,,,,OK
+TIM-004,HEARTBEAT,2026-10-21T13:04:00,PROG-001,,,,,,,OK
+TIM-005,HEARTBEAT,2026-10-21T13:05:00,PROG-001,,,,,,,OK
+

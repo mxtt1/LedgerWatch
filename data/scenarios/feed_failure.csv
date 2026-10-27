@@ -1,0 +1,4 @@
+event_id,event_type,event_timestamp,program_id,middleware_txn_id,end_user_id,bank_account_id,amount,direction,customer_balance,heartbeat_status
+FED-001,HEARTBEAT,2026-10-21T12:00:00,PROG-001,,,,,,,OK
+FED-002,HEARTBEAT,2026-10-21T12:01:00,PROG-001,,,,,,,OK
+
