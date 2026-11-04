@@ -20,11 +20,11 @@ def reset_database(db_path: str | Path = DB_PATH, scenario: str = "normal") -> N
 
         conn.execute(
             """INSERT INTO programs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("PROG-001", "Northstar Wallet Program", "BridgeLayer (Synthetic)", "FBO-001", "USD", "ACTIVE", 1, None, None, BASE_TIME, BASE_TIME),
+            ("PROG-001", "Northstar Wallet Program", "Synapse (middleware)", "FBO-001", "USD", "ACTIVE", 1, None, None, BASE_TIME, BASE_TIME),
         )
         conn.execute(
             """INSERT INTO bank_accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("FBO-001", "PROG-001", "Northstar Customer Funds FBO", "FBO", "USD", 10000.0, 10000.0, "ACTIVE", BASE_TIME),
+            ("FBO-001", "PROG-001", "Evolve Bank & Trust · Northstar customer funds FBO", "FBO", "USD", 10000.0, 10000.0, "ACTIVE", BASE_TIME),
         )
         bank_fixture = pd.read_csv(DATA_DIR / "bank_transactions.csv", dtype=str, keep_default_na=False)
         bank_transactions = [

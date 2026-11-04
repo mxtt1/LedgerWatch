@@ -6,7 +6,7 @@ import pandas as pd
 
 from . import BATCH_DIR
 from .audit import log
-from .risk_engine import create_exception, evaluate_risk, get_settings_from_conn
+from .risk_engine import create_exception, evaluate_risk, get_settings_from_conn, reclassify_exception
 
 
 REQUIRED_TRANSACTION_FIELDS = ("middleware_txn_id", "end_user_id", "bank_account_id", "amount", "direction")
@@ -323,9 +323,10 @@ def formal_reconciliation(conn, now: str, actor: str = "DEMO USER", program_id: 
         ).fetchone()
         if existing:
             conn.execute(
-                "UPDATE exceptions SET amount_difference=?, resolution_notes=? WHERE exception_id=?",
-                (control_exposure, f"Latest failed batch: {batch['batch_id']}", existing["exception_id"]),
+                "UPDATE exceptions SET resolution_notes=? WHERE exception_id=?",
+                (f"Latest failed batch: {batch['batch_id']}", existing["exception_id"]),
             )
+            reclassify_exception(conn, existing["exception_id"], control_exposure, now)
         else:
             create_exception(conn, "AGGREGATE_BALANCE_MISMATCH", control_exposure, now, program_id=program_id, owner="Reconciliation Analyst")
         evaluate_risk(conn, now, program_id)

@@ -1,10 +1,18 @@
-"""Exposure, exception-age, feed-health, override, and circuit-breaker rules."""
+"""Exposure, risk levels, resolution deadlines, daily checkpoint, feed-health and override rules."""
 
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 from .audit import log
-from .config import FINANCIAL_EXCEPTION_TYPES, UNRESOLVED_STATUSES, feed_health, format_duration, status_for_exposure
+from .config import (
+    FINANCIAL_EXCEPTION_TYPES,
+    UNRESOLVED_STATUSES,
+    deadline_seconds_for,
+    feed_health,
+    format_duration,
+    risk_level_for,
+    status_for_exposure,
+)
 from .db import get_settings
 
 
@@ -51,19 +59,47 @@ def create_exception(
     owner: str | None = "Unassigned",
 ) -> str:
     settings = get_settings_from_conn(conn)
-    due_at = (
-        _dt(now) + timedelta(seconds=float(settings["max_open_exception_age_seconds"]))
-    ).isoformat(timespec="seconds")
+    risk_level = risk_level_for(exception_type, amount_difference, settings)
+    allowed = deadline_seconds_for(risk_level, settings)
+    due_at = (_dt(now) + timedelta(seconds=allowed)).isoformat(timespec="seconds")
     exception_id = f"EXC-{uuid4().hex[:10].upper()}"
     conn.execute(
         """INSERT INTO exceptions(exception_id, program_id, exception_type, middleware_txn_id, bank_txn_id,
-           amount_difference, status, owner, created_at, due_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)""",
-        (exception_id, program_id, exception_type, middleware_txn_id, bank_txn_id, abs(float(amount_difference)), owner, now, due_at),
+           amount_difference, status, owner, created_at, due_at, risk_level)
+           VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)""",
+        (exception_id, program_id, exception_type, middleware_txn_id, bank_txn_id, abs(float(amount_difference)), owner, now, due_at, risk_level),
     )
-    detail = f"{exception_type} created; impact ${abs(float(amount_difference)):,.2f}."
+    detail = (
+        f"{exception_type} created; impact ${abs(float(amount_difference)):,.2f}; "
+        f"{risk_level} risk; resolve within {format_duration(allowed)} (by {due_at})."
+    )
     log(conn, "EXCEPTION_CREATED", detail, now, program_id)
     return exception_id
+
+
+def reclassify_exception(conn, exception_id: str, amount_difference: float, now: str) -> None:
+    """Re-level an exception whose amount changed. A higher level can only shorten the deadline."""
+    exc = conn.execute("SELECT * FROM exceptions WHERE exception_id = ?", (exception_id,)).fetchone()
+    settings = get_settings_from_conn(conn)
+    risk_level = risk_level_for(exc["exception_type"], amount_difference, settings)
+    allowed = deadline_seconds_for(risk_level, settings)
+    due_at = min(exc["due_at"], (_dt(exc["created_at"]) + timedelta(seconds=allowed)).isoformat(timespec="seconds"))
+    conn.execute(
+        "UPDATE exceptions SET amount_difference = ?, risk_level = ?, due_at = ? WHERE exception_id = ?",
+        (abs(float(amount_difference)), risk_level, due_at, exception_id),
+    )
+    if risk_level != exc["risk_level"]:
+        log(conn, "EXCEPTION_RECLASSIFIED", f"{exception_id}: {exc['risk_level']} → {risk_level} risk; resolve by {due_at}.", now, exc["program_id"])
+
+
+def overdue_exceptions(conn, now: str, program_id: str = "PROG-001") -> list:
+    """Unresolved exceptions past their resolution deadline. The clock runs while OPEN or INVESTIGATING."""
+    placeholders = ",".join("?" for _ in UNRESOLVED_STATUSES)
+    return conn.execute(
+        f"""SELECT * FROM exceptions WHERE program_id = ? AND status IN ({placeholders}) AND due_at < ?
+            ORDER BY due_at""",
+        (program_id, *UNRESOLVED_STATUSES, now),
+    ).fetchall()
 
 
 def get_settings_from_conn(conn) -> dict:
@@ -101,47 +137,85 @@ def restrict_program(conn, reason: str, now: str, program_id: str = "PROG-001") 
 
 
 def evaluate_risk(conn, now: str, program_id: str = "PROG-001") -> dict:
+    """Live monitoring: update the warning/high-risk label only. Financial restriction waits for the daily checkpoint."""
     settings = get_settings_from_conn(conn)
     exposure = unresolved_exposure(conn, program_id)
     count = open_exception_count(conn, program_id)
     desired_status = status_for_exposure(exposure, settings)
+    if desired_status == "RESTRICTED":
+        desired_status = "HIGH_RISK"
     program = conn.execute("SELECT * FROM programs WHERE program_id = ?", (program_id,)).fetchone()
 
-    restricted = False
-    if exposure >= float(settings["restriction_discrepancy_amount"]):
-        reason = (
-            f"Cumulative confirmed discrepancy ${exposure:,.2f} reached the configured "
-            f"${float(settings['restriction_discrepancy_amount']):,.2f} restriction threshold."
-        )
-        restricted = restrict_program(conn, reason, now, program_id)
-    elif count >= int(settings["max_confirmed_exception_count"]):
-        reason = f"Open exception count {count} reached configured limit {settings['max_confirmed_exception_count']}."
-        restricted = restrict_program(conn, reason, now, program_id)
-    elif program["status"] != "RESTRICTED" and program["status"] != desired_status:
+    if program["status"] != "RESTRICTED" and program["status"] != desired_status:
         old = program["status"]
         conn.execute("UPDATE programs SET status = ?, updated_at = ? WHERE program_id = ?", (desired_status, now, program_id))
         if desired_status in {"WARNING", "HIGH_RISK"}:
-            log(conn, "THRESHOLD_BREACHED", f"Program moved {old} → {desired_status}; unresolved exposure ${exposure:,.2f}.", now, program_id)
-
-    restrict_aged_open_exception(conn, now, program_id)
-    return {"exposure": exposure, "count": count, "restricted": restricted}
+            log(conn, "THRESHOLD_BREACHED", f"Program moved {old} → {desired_status}; unresolved exposure ${exposure:,.2f}. Restriction is decided at the daily checkpoint.", now, program_id)
+    return {"exposure": exposure, "count": count}
 
 
-def restrict_aged_open_exception(conn, now: str, program_id: str = "PROG-001") -> None:
+def checkpoint_rules(conn, now: str, program_id: str = "PROG-001") -> list[dict]:
+    """The restriction rules applied at the daily checkpoint, each with its current value and limit."""
     settings = get_settings_from_conn(conn)
-    maximum_age = float(settings["max_open_exception_age_seconds"])
-    for exc in conn.execute(
-        "SELECT * FROM exceptions WHERE program_id = ? AND status = 'OPEN'",
-        (program_id,),
-    ).fetchall():
-        age = (_dt(now) - _dt(exc["created_at"])).total_seconds()
-        if age >= maximum_age:
-            restrict_program(
-                conn,
-                f"Open exception {exc['exception_id']} ({exc['exception_type']}) was not taken into investigation within {format_duration(maximum_age)}.",
-                now,
-                program_id,
-            )
+    exposure = unresolved_exposure(conn, program_id)
+    count = open_exception_count(conn, program_id)
+    overdue = overdue_exceptions(conn, now, program_id)
+    return [
+        {
+            "rule": "Missed resolution deadline",
+            "value": f"{len(overdue)} overdue",
+            "limit": "0 overdue",
+            "breached": bool(overdue),
+            "reason": (
+                f"{len(overdue)} unresolved exception(s) passed their resolution deadline: "
+                + ", ".join(f"{item['exception_id']} ({item['risk_level']}, due {item['due_at']})" for item in overdue)
+            ) if overdue else "",
+        },
+        {
+            "rule": "Unresolved financial exposure",
+            "value": f"${exposure:,.2f}",
+            "limit": f"${float(settings['restriction_discrepancy_amount']):,.2f}",
+            "breached": exposure >= float(settings["restriction_discrepancy_amount"]),
+            "reason": f"Unresolved exposure ${exposure:,.2f} reached the ${float(settings['restriction_discrepancy_amount']):,.2f} limit.",
+        },
+        {
+            "rule": "Unresolved exception count",
+            "value": str(count),
+            "limit": str(settings["max_confirmed_exception_count"]),
+            "breached": count >= int(settings["max_confirmed_exception_count"]),
+            "reason": f"{count} unresolved exceptions reached the limit of {settings['max_confirmed_exception_count']}.",
+        },
+    ]
+
+
+def run_daily_checkpoint(conn, now: str, actor: str, program_id: str = "PROG-001") -> dict:
+    """Explicit end-of-day evaluation that applies the agreed restriction rules."""
+    rules = checkpoint_rules(conn, now, program_id)
+    breached = [rule for rule in rules if rule["breached"]]
+    program = conn.execute("SELECT * FROM programs WHERE program_id = ?", (program_id,)).fetchone()
+    if not breached:
+        outcome = "NO_RESTRICTION"
+    elif program["status"] == "RESTRICTED":
+        outcome = "ALREADY_RESTRICTED"
+    elif not program["auto_restrict_enabled"]:
+        outcome = "BREACHED_AUTO_RESTRICT_OFF"
+    else:
+        outcome = "RESTRICTED"
+
+    overdue = overdue_exceptions(conn, now, program_id)
+    conn.execute(
+        "INSERT INTO daily_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"CHK-{uuid4().hex[:8].upper()}", program_id, now, actor,
+            unresolved_exposure(conn, program_id), open_exception_count(conn, program_id), len(overdue),
+            "; ".join(rule["rule"] for rule in breached), outcome,
+        ),
+    )
+    summary = "; ".join(f"{rule['rule']}: {rule['value']} (limit {rule['limit']}){' BREACHED' if rule['breached'] else ''}" for rule in rules)
+    log(conn, "DAILY_CHECKPOINT_RUN", f"{summary}. Outcome: {outcome}.", now, program_id, actor)
+    if outcome == "RESTRICTED":
+        restrict_program(conn, "Daily checkpoint: " + " ".join(rule["reason"] for rule in breached), now, program_id)
+    return {"outcome": outcome, "rules": rules}
 
 
 def resume_program_with_override(

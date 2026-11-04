@@ -4,14 +4,19 @@ import streamlit as st
 from ledgerwatch.audit import log
 from ledgerwatch.db import get_runtime, row, rows, transaction
 from ledgerwatch.risk_engine import evaluate_risk
+from ledgerwatch.config import RISK_LEVELS, risk_band_text
 from ledgerwatch.ui import (
     audit_table,
     configure_page,
+    deadline_text,
     format_age,
     page_header,
     program_snapshot,
     restriction_banner,
+    risk_badge,
+    risk_level_cards,
     status_badge,
+    style_risk_column,
 )
 
 
@@ -24,10 +29,21 @@ page_header(
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 
-f1, f2 = st.columns(2)
+st.markdown("**Unresolved exceptions by risk level**")
+risk_level_cards(snapshot)
+st.caption(
+    "Each exception's risk level is separate from the overall program status. Financial exceptions are levelled by amount "
+    f"({risk_band_text(snapshot['settings'])}, editable under Configuration); "
+    "a stale feed is Medium and a feed failure is Critical. "
+    "The resolution deadline keeps running while an exception is OPEN or INVESTIGATING."
+)
+st.write("")
+
+f1, f2, f3 = st.columns(3)
 status_filter = f1.multiselect(
     "Status", ["OPEN", "INVESTIGATING", "RESOLVED", "OVERRIDDEN"], default=[]
 )
+risk_filter = f3.multiselect("Risk level", list(RISK_LEVELS), default=[])
 type_filter = f2.selectbox(
     "Exception type",
     ["All"]
@@ -44,13 +60,15 @@ if status_filter:
 if type_filter != "All":
     clauses.append("exception_type = ?")
     params.append(type_filter)
+if risk_filter:
+    clauses.append("risk_level IN (%s)" % ",".join("?" * len(risk_filter)))
+    params.extend(risk_filter)
 where = " WHERE " + " AND ".join(clauses) if clauses else ""
 exceptions = rows(
     f"""SELECT * FROM exceptions{where}
-        ORDER BY CASE status
-            WHEN 'OPEN' THEN 1 WHEN 'INVESTIGATING' THEN 2
-            WHEN 'RESOLVED' THEN 3 ELSE 4
-        END, created_at DESC""",
+        ORDER BY CASE WHEN status IN ('OPEN','INVESTIGATING') THEN 1 ELSE 2 END,
+            CASE risk_level WHEN 'Critical' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+            due_at""",
     tuple(params),
 )
 
@@ -60,29 +78,45 @@ if not exceptions:
     )
 else:
     frame = pd.DataFrame(
-        [{**exc, "age": format_age(exc["created_at"], snapshot["sim_time"])} for exc in exceptions]
+        [
+            {
+                **exc,
+                "age": format_age(exc["created_at"], snapshot["sim_time"]),
+                "time_left": deadline_text(exc["due_at"], snapshot["sim_time"], exc["status"]),
+                "due_at": exc["due_at"].replace("T", " "),
+            }
+            for exc in exceptions
+        ]
+    )
+    table = frame[
+        [
+            "exception_id",
+            "risk_level",
+            "exception_type",
+            "amount_difference",
+            "status",
+            "owner",
+            "age",
+            "due_at",
+            "time_left",
+        ]
+    ].rename(
+        columns={
+            "exception_id": "ID",
+            "risk_level": "Risk level",
+            "exception_type": "Type",
+            "amount_difference": "Impact",
+            "status": "Status",
+            "owner": "Owner",
+            "age": "Age",
+            "due_at": "Resolve by",
+            "time_left": "Time remaining",
+        }
     )
     st.dataframe(
-        frame[
-            [
-                "exception_id",
-                "exception_type",
-                "amount_difference",
-                "status",
-                "owner",
-                "age",
-                "due_at",
-            ]
-        ].rename(
-            columns={
-                "exception_id": "ID",
-                "exception_type": "Type",
-                "amount_difference": "Impact",
-                "status": "Status",
-                "owner": "Owner",
-                "age": "Age",
-                "due_at": "Open-age deadline",
-            }
+        style_risk_column(table).map(
+            lambda value: "color:#b42335; font-weight:700" if str(value).startswith("OVERDUE") else "",
+            subset=["Time remaining"],
         ),
         width="stretch",
         hide_index=True,
@@ -91,7 +125,7 @@ else:
 
     st.subheader("Investigation workspace")
     labels = {
-        f"{exc['exception_id']} · {exc['exception_type']} · ${exc['amount_difference']:,.2f}": exc[
+        f"{exc['exception_id']} · {exc['risk_level'] or '—'} · {exc['exception_type']} · ${exc['amount_difference']:,.2f}": exc[
             "exception_id"
         ]
         for exc in exceptions
@@ -104,18 +138,20 @@ else:
         else None
     )
 
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4, d5 = st.columns(5)
     d1.markdown(f"**Status**<br>{status_badge(exc['status'])}", unsafe_allow_html=True)
-    d2.metric("Financial impact", f"${exc['amount_difference']:,.2f}")
-    d3.metric("Age", format_age(exc["created_at"], snapshot["sim_time"]))
+    d2.markdown(f"**Risk level**<br>{risk_badge(exc['risk_level'])}", unsafe_allow_html=True)
+    d3.metric("Financial impact", f"${exc['amount_difference']:,.2f}")
+    d4.metric("Age", format_age(exc["created_at"], snapshot["sim_time"]))
+    d5.metric("Time remaining", deadline_text(exc["due_at"], snapshot["sim_time"], exc["status"]))
     st.caption(
-        f"Middleware reference: {exc['middleware_txn_id'] or '—'} · "
-        f"Bank record: {exc['bank_txn_id'] or 'No matching record'} · "
-        f"Open-age deadline: {exc['due_at']}"
+        f"Synapse reference: {exc['middleware_txn_id'] or '—'} · "
+        f"Evolve record: {exc['bank_txn_id'] or 'No matching record'} · "
+        f"Resolve by: {exc['due_at'].replace('T', ' ')} (scenario time; the deadline keeps running while INVESTIGATING)"
     )
     if bank:
         st.write(
-            f"Bank comparison: {bank['direction']} ${bank['amount']:,.2f} · "
+            f"Evolve record: {bank['direction']} ${bank['amount']:,.2f} · "
             f"{bank['account_id']} · {bank['status']}"
         )
 

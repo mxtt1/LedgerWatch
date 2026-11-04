@@ -6,9 +6,13 @@ DEFAULT_SETTINGS = {
     "heartbeat_critical_seconds": (300, "int", "Five minutes without a heartbeat before critical feed failure"),
     "warning_discrepancy_amount": (1000.0, "float", "Cumulative unresolved exposure warning"),
     "high_discrepancy_amount": (5000.0, "float", "High-risk escalation threshold"),
-    "restriction_discrepancy_amount": (10000.0, "float", "Automatic service restriction threshold"),
-    "max_open_exception_age_seconds": (86400, "int", "Maximum age of an uninvestigated open exception"),
-    "max_confirmed_exception_count": (10, "int", "Count-based restriction trigger"),
+    "restriction_discrepancy_amount": (10000.0, "float", "Daily checkpoint exposure restriction threshold"),
+    "max_confirmed_exception_count": (10, "int", "Daily checkpoint count restriction threshold"),
+    "risk_medium_amount": (1000.0, "float", "Single-exception amount from which an exception is Medium risk"),
+    "risk_critical_amount": (5000.0, "float", "Single-exception amount from which an exception is Critical risk"),
+    "deadline_low_seconds": (259200, "int", "Time allowed to resolve a Low risk exception"),
+    "deadline_medium_seconds": (86400, "int", "Time allowed to resolve a Medium risk exception"),
+    "deadline_critical_seconds": (14400, "int", "Time allowed to resolve a Critical risk exception"),
     "aggregate_tolerance": (0.01, "float", "Allowed difference in formal reconciliation"),
     "formal_reconciliation_interval": ("Manual / EOD simulation", "string", "Prototype schedule"),
 }
@@ -23,6 +27,32 @@ FINANCIAL_EXCEPTION_TYPES = {
 }
 
 UNRESOLVED_STATUSES = ("OPEN", "INVESTIGATING")
+
+RISK_LEVELS = ("Critical", "Medium", "Low")
+# Feed exceptions carry no amount, so their level comes from the exception type.
+FEED_RISK_LEVELS = {"STALE_FEED": "Medium", "FEED_FAILURE": "Critical"}
+
+
+def risk_level_for(exception_type: str, amount: float, settings: dict) -> str:
+    """Level one exception by its own amount, using the configured bands (lower bound inclusive)."""
+    if exception_type in FEED_RISK_LEVELS:
+        return FEED_RISK_LEVELS[exception_type]
+    amount = abs(float(amount))
+    if amount >= float(settings["risk_critical_amount"]):
+        return "Critical"
+    if amount >= float(settings["risk_medium_amount"]):
+        return "Medium"
+    return "Low"
+
+
+def risk_band_text(settings: dict) -> str:
+    """Band description for Markdown captions; dollar signs are escaped so Streamlit does not render LaTeX."""
+    medium, critical = float(settings["risk_medium_amount"]), float(settings["risk_critical_amount"])
+    return f"Low under \\${medium:,.0f} · Medium from \\${medium:,.0f} · Critical from \\${critical:,.0f}"
+
+
+def deadline_seconds_for(risk_level: str, settings: dict) -> int:
+    return int(settings[f"deadline_{risk_level.lower()}_seconds"])
 
 
 def format_duration(seconds: float) -> str:
