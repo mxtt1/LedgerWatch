@@ -4,14 +4,19 @@ import streamlit as st
 from ledgerwatch.audit import log
 from ledgerwatch.db import get_runtime, row, rows, transaction
 from ledgerwatch.risk_engine import evaluate_risk
+from ledgerwatch.config import EXCEPTION_OWNERS, RISK_LEVELS, risk_band_text
 from ledgerwatch.ui import (
     audit_table,
     configure_page,
+    deadline_text,
     format_age,
     page_header,
     program_snapshot,
     restriction_banner,
+    risk_badge,
+    risk_level_cards,
     status_badge,
+    style_risk_column,
 )
 
 
@@ -24,10 +29,21 @@ page_header(
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 
-f1, f2 = st.columns(2)
+st.markdown("**Unresolved exceptions by risk level**")
+risk_level_cards(snapshot)
+st.caption(
+    "Each exception's risk level is separate from the overall program status. Financial exceptions are levelled by amount "
+    f"({risk_band_text(snapshot['settings'])}, editable under Configuration); "
+    "a stale feed is Medium and a feed failure is Critical. "
+    "The resolution deadline keeps running while an exception is OPEN or INVESTIGATING."
+)
+st.write("")
+
+f1, f2, f3 = st.columns(3)
 status_filter = f1.multiselect(
     "Status", ["OPEN", "INVESTIGATING", "RESOLVED", "OVERRIDDEN"], default=[]
 )
+risk_filter = f3.multiselect("Risk level", list(RISK_LEVELS), default=[])
 type_filter = f2.selectbox(
     "Exception type",
     ["All"]
@@ -44,13 +60,15 @@ if status_filter:
 if type_filter != "All":
     clauses.append("exception_type = ?")
     params.append(type_filter)
+if risk_filter:
+    clauses.append("risk_level IN (%s)" % ",".join("?" * len(risk_filter)))
+    params.extend(risk_filter)
 where = " WHERE " + " AND ".join(clauses) if clauses else ""
 exceptions = rows(
     f"""SELECT * FROM exceptions{where}
-        ORDER BY CASE status
-            WHEN 'OPEN' THEN 1 WHEN 'INVESTIGATING' THEN 2
-            WHEN 'RESOLVED' THEN 3 ELSE 4
-        END, created_at DESC""",
+        ORDER BY CASE WHEN status IN ('OPEN','INVESTIGATING') THEN 1 ELSE 2 END,
+            CASE risk_level WHEN 'Critical' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+            due_at""",
     tuple(params),
 )
 
@@ -60,29 +78,45 @@ if not exceptions:
     )
 else:
     frame = pd.DataFrame(
-        [{**exc, "age": format_age(exc["created_at"], snapshot["sim_time"])} for exc in exceptions]
+        [
+            {
+                **exc,
+                "age": format_age(exc["created_at"], snapshot["sim_time"]),
+                "time_left": deadline_text(exc["due_at"], snapshot["sim_time"], exc["status"]),
+                "due_at": exc["due_at"].replace("T", " "),
+            }
+            for exc in exceptions
+        ]
+    )
+    table = frame[
+        [
+            "exception_id",
+            "risk_level",
+            "exception_type",
+            "amount_difference",
+            "status",
+            "owner",
+            "age",
+            "due_at",
+            "time_left",
+        ]
+    ].rename(
+        columns={
+            "exception_id": "ID",
+            "risk_level": "Risk level",
+            "exception_type": "Type",
+            "amount_difference": "Impact",
+            "status": "Status",
+            "owner": "Owner",
+            "age": "Age",
+            "due_at": "Resolve by",
+            "time_left": "Time remaining",
+        }
     )
     st.dataframe(
-        frame[
-            [
-                "exception_id",
-                "exception_type",
-                "amount_difference",
-                "status",
-                "owner",
-                "age",
-                "due_at",
-            ]
-        ].rename(
-            columns={
-                "exception_id": "ID",
-                "exception_type": "Type",
-                "amount_difference": "Impact",
-                "status": "Status",
-                "owner": "Owner",
-                "age": "Age",
-                "due_at": "Open-age deadline",
-            }
+        style_risk_column(table).map(
+            lambda value: "color:#b42335; font-weight:700" if str(value).startswith("OVERDUE") else "",
+            subset=["Time remaining"],
         ),
         width="stretch",
         hide_index=True,
@@ -91,7 +125,7 @@ else:
 
     st.subheader("Investigation workspace")
     labels = {
-        f"{exc['exception_id']} · {exc['exception_type']} · ${exc['amount_difference']:,.2f}": exc[
+        f"{exc['exception_id']} · {exc['risk_level'] or '—'} · {exc['exception_type']} · ${exc['amount_difference']:,.2f}": exc[
             "exception_id"
         ]
         for exc in exceptions
@@ -104,20 +138,108 @@ else:
         else None
     )
 
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4, d5 = st.columns(5)
     d1.markdown(f"**Status**<br>{status_badge(exc['status'])}", unsafe_allow_html=True)
-    d2.metric("Financial impact", f"${exc['amount_difference']:,.2f}")
-    d3.metric("Age", format_age(exc["created_at"], snapshot["sim_time"]))
+    d2.markdown(f"**Risk level**<br>{risk_badge(exc['risk_level'])}", unsafe_allow_html=True)
+    d3.metric("Financial impact", f"${exc['amount_difference']:,.2f}")
+    d4.metric("Age", format_age(exc["created_at"], snapshot["sim_time"]))
+    d5.metric("Time remaining", deadline_text(exc["due_at"], snapshot["sim_time"], exc["status"]))
     st.caption(
-        f"Middleware reference: {exc['middleware_txn_id'] or '—'} · "
-        f"Bank record: {exc['bank_txn_id'] or 'No matching record'} · "
-        f"Open-age deadline: {exc['due_at']}"
+        f"Synapse reference: {exc['middleware_txn_id'] or '—'} · "
+        f"Evolve record: {exc['bank_txn_id'] or 'No matching record'} · "
+        f"Resolve by: {exc['due_at'].replace('T', ' ')} (scenario time; the deadline keeps running while INVESTIGATING)"
     )
     if bank:
         st.write(
-            f"Bank comparison: {bank['direction']} ${bank['amount']:,.2f} · "
+            f"Evolve record: {bank['direction']} ${bank['amount']:,.2f} · "
             f"{bank['account_id']} · {bank['status']}"
         )
+
+    st.markdown("**Relevant investigation evidence**")
+    evidence_left, evidence_right = st.columns(2)
+    linked_events = (
+        rows(
+            """SELECT event_id, event_timestamp, end_user_id, amount, direction,
+                      bank_account_id, result_status, bank_txn_id
+               FROM processed_events
+               WHERE event_type='TRANSACTION' AND middleware_txn_id=?
+               ORDER BY event_timestamp, rowid""",
+            (exc["middleware_txn_id"],),
+        )
+        if exc["middleware_txn_id"]
+        else []
+    )
+    with evidence_left:
+        st.caption("Linked Synapse events")
+        if linked_events:
+            event_frame = pd.DataFrame(linked_events).rename(columns={
+                "event_id": "Event",
+                "event_timestamp": "Event time",
+                "end_user_id": "End user",
+                "amount": "Amount",
+                "direction": "Direction",
+                "bank_account_id": "FBO account",
+                "result_status": "Result",
+                "bank_txn_id": "Evolve record",
+            })
+            st.dataframe(
+                event_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
+            )
+        else:
+            st.info("This exception has no linked transaction events.")
+    with evidence_right:
+        st.caption("Linked Evolve bank transaction")
+        if bank:
+            bank_frame = pd.DataFrame([{
+                "Bank transaction": bank["bank_txn_id"],
+                "Reference": bank["middleware_reference"],
+                "Account": bank["account_id"],
+                "Amount": bank["amount"],
+                "Direction": bank["direction"],
+                "Status": bank["status"],
+                "Decision time": bank["posted_at"],
+            }])
+            st.dataframe(
+                bank_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
+            )
+        else:
+            st.info("No bank transaction is linked to this exception.")
+
+    evidence_tokens = [
+        value for value in (exc["exception_id"], exc["middleware_txn_id"], exc["bank_txn_id"])
+        if value
+    ]
+    evidence_clauses = ["details LIKE ?" for _ in evidence_tokens]
+    evidence_params = [f"%{value}%" for value in evidence_tokens]
+    if exc["exception_type"] == "AGGREGATE_BALANCE_MISMATCH":
+        evidence_clauses.append("event_type IN ('EOD_BATCH_RECEIVED','FORMAL_RECON_RUN','EXCEPTION_EVIDENCE_LINKED')")
+    elif exc["exception_type"] in {"STALE_FEED", "FEED_FAILURE"}:
+        evidence_clauses.append("event_type IN ('HEARTBEAT_RECEIVED','THRESHOLD_BREACHED','SERVICE_RESTRICTED')")
+    relevant_audit = rows(
+        f"""SELECT created_at, event_type, actor, details FROM audit_log
+            WHERE program_id=? AND ({' OR '.join(evidence_clauses)})
+            ORDER BY rowid DESC LIMIT 50""",
+        (exc["program_id"], *evidence_params),
+    )
+    st.caption("Relevant evidence log entries")
+    if relevant_audit:
+        audit_frame = pd.DataFrame(relevant_audit).rename(columns={
+            "created_at": "Time", "event_type": "Event", "actor": "Actor", "details": "Evidence",
+        })
+        st.dataframe(
+            audit_frame,
+            width="stretch",
+            hide_index=True,
+            height=min(320, 38 + len(audit_frame) * 35),
+        )
+    else:
+        st.info("No linked evidence-log entries were found for this exception.")
 
     if exc["status"] in {"RESOLVED", "OVERRIDDEN"}:
         st.info(
@@ -128,7 +250,7 @@ else:
             st.write("**Closure notes**")
             st.write(exc["resolution_notes"])
     else:
-        owners = ["Unassigned", "Reconciliation Analyst", "Risk / Compliance", "Management"]
+        owners = list(EXCEPTION_OWNERS)
         owner_index = owners.index(exc["owner"]) if exc["owner"] in owners else 0
         with st.form("exception_action"):
             owner = st.selectbox("Owner", owners, index=owner_index)

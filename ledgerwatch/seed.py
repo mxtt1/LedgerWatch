@@ -7,24 +7,44 @@ import pandas as pd
 from . import BATCH_DIR, DATA_DIR, DB_PATH, SCENARIO_DIR
 from .audit import log
 from .config import DEFAULT_SETTINGS
-from .db import init_db, set_runtime, transaction
+from .db import connect, init_db, set_runtime, transaction
 
 BASE_TIME = "2026-10-21T09:59:00"
 
 
-def reset_database(db_path: str | Path = DB_PATH, scenario: str = "normal") -> None:
+def reset_database(
+    db_path: str | Path = DB_PATH,
+    scenario: str = "normal",
+    preserve_configuration: bool = False,
+) -> None:
     path = Path(db_path)
+    saved_settings = []
+    saved_auto_restrict = 1
+    if preserve_configuration and path.exists():
+        conn = connect(path)
+        try:
+            saved_settings = conn.execute(
+                "SELECT key, value FROM settings"
+            ).fetchall()
+            program = conn.execute(
+                "SELECT auto_restrict_enabled FROM programs WHERE program_id='PROG-001'"
+            ).fetchone()
+            if program:
+                saved_auto_restrict = int(program["auto_restrict_enabled"])
+        finally:
+            conn.close()
+
     path.unlink(missing_ok=True)
     init_db(path)
     with transaction(path) as conn:
 
         conn.execute(
             """INSERT INTO programs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("PROG-001", "Northstar Wallet Program", "BridgeLayer (Synthetic)", "FBO-001", "USD", "ACTIVE", 1, None, None, BASE_TIME, BASE_TIME),
+            ("PROG-001", "Northstar Wallet Program", "Synapse (middleware)", "FBO-001", "USD", "ACTIVE", saved_auto_restrict, None, None, BASE_TIME, BASE_TIME),
         )
         conn.execute(
             """INSERT INTO bank_accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("FBO-001", "PROG-001", "Northstar Customer Funds FBO", "FBO", "USD", 10000.0, 10000.0, "ACTIVE", BASE_TIME),
+            ("FBO-001", "PROG-001", "Evolve Bank & Trust · Northstar customer funds FBO", "FBO", "USD", 10000.0, 10000.0, "ACTIVE", BASE_TIME),
         )
         bank_fixture = pd.read_csv(DATA_DIR / "bank_transactions.csv", dtype=str, keep_default_na=False)
         bank_transactions = [
@@ -42,6 +62,11 @@ def reset_database(db_path: str | Path = DB_PATH, scenario: str = "normal") -> N
 
         for key, (value, data_type, description) in DEFAULT_SETTINGS.items():
             conn.execute("INSERT INTO settings VALUES (?, ?, ?, ?)", (key, str(value), data_type, description))
+        for item in saved_settings:
+            conn.execute(
+                "UPDATE settings SET value=? WHERE key=?",
+                (item["value"], item["key"]),
+            )
 
         scenario_path = SCENARIO_DIR / f"{scenario}.csv"
         batch_path = BATCH_DIR / f"{scenario}.csv"

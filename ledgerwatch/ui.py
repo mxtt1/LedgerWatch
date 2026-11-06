@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from . import DB_PATH
-from .config import format_duration
+from .config import RISK_LEVELS, format_duration
 from .db import get_runtime, get_settings, row, rows
 from .seed import ensure_database
 
@@ -16,7 +16,7 @@ def configure_page(title: str, icon: str = "◉") -> str:
     ensure_database()
     inject_css()
     with st.sidebar:
-        st.markdown('<div class="brand"><div class="brand-mark">LW</div><div><b>LedgerWatch</b><small>Bank assurance console</small></div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="brand"><div class="brand-mark">LW</div><div><b>LedgerWatch</b><small>Evolve Bank &amp; Trust · assurance console</small></div></div>', unsafe_allow_html=True)
         st.caption("SYNTHETIC DATA · PROTOTYPE")
         role = st.selectbox("Acting role", ["Operations", "Risk / Compliance", "Management"], key="active_role")
         st.divider()
@@ -25,7 +25,7 @@ def configure_page(title: str, icon: str = "◉") -> str:
         st.markdown(f"**{program['program_name']}**")
         st.markdown(status_badge(program["status"]), unsafe_allow_html=True)
         st.divider()
-        st.caption("All names, accounts and values are synthetic. No banking rails are connected.")
+        st.caption("Evolve and Synapse are case-study names. All customers, accounts and values are synthetic; no banking rails are connected.")
     return role
 
 
@@ -57,6 +57,22 @@ def inject_css() -> None:
         .RESTRICTED,.CRITICAL,.CONFIRMED_EXCEPTION,.FEED_FAILURE,.BLOCKED_BY_RESTRICTION { background:#ffe0e3; color:#b42335; }
         .AWAITING_HEARTBEAT,.OPEN { background:#e7edf3; color:#486581; }
         .OVERRIDDEN { background:#ece7f7; color:#5b3a86; }
+        .risk-Critical { background:#ffe0e3; color:#b42335; }
+        .risk-Medium { background:#fff0c2; color:#8c5b00; }
+        .risk-Low { background:#e1eefb; color:#1d5b99; }
+        .risk-card { background:white; border:1px solid #dce5ea; border-left:6px solid #9fb3c8; border-radius:12px; padding:.85rem 1rem; }
+        .risk-card.Critical { border-left-color:#d64555; }
+        .risk-card.Medium { border-left-color:#e0a12a; }
+        .risk-card.Low { border-left-color:#4a8fd6; }
+        .risk-card small { color:#627d98; text-transform:uppercase; letter-spacing:.06em; font-weight:700; }
+        .risk-card b { display:block; color:#102a43; font-size:1.6rem; line-height:1.2; }
+        .risk-card span { color:#486581; font-size:.85rem; }
+        .flow-step { background:white; border:1px solid #dce5ea; border-top:4px solid #087f8c; border-radius:12px; padding:.85rem 1rem; min-height:150px; }
+        .flow-step.fail { border-top-color:#d64555; }
+        .flow-step.wait { border-top-color:#e0a12a; }
+        .flow-step small { color:#087f8c; text-transform:uppercase; letter-spacing:.08em; font-weight:800; font-size:.7rem; }
+        .flow-step b { display:block; color:#102a43; margin:.25rem 0 .35rem; }
+        .flow-step p { color:#486581; font-size:.86rem; margin:0; }
         .restriction { background:#7f1d2d; color:white; border-radius:12px; padding:1rem 1.2rem; margin:.4rem 0 1.2rem; border-left:6px solid #ffb4bc; }
         .restriction strong { color:white; display:block; margin-bottom:.2rem; }
         .info-card { background:white; border:1px solid #dce5ea; border-radius:12px; padding:1rem 1.1rem; min-height:105px; }
@@ -101,12 +117,54 @@ def status_badge(status: str) -> str:
     return f'<span class="status-badge {safe}">{status or "UNKNOWN"}</span>'
 
 
+def risk_badge(level: str | None) -> str:
+    if not level:
+        return '<span class="status-badge">—</span>'
+    return f'<span class="status-badge risk-{level}">{level.upper()}</span>'
+
+
+RISK_CELL_STYLES = {
+    "Critical": "background-color:#ffe0e3; color:#b42335; font-weight:700",
+    "Medium": "background-color:#fff0c2; color:#8c5b00; font-weight:700",
+    "Low": "background-color:#e1eefb; color:#1d5b99; font-weight:700",
+}
+
+
+def style_risk_column(frame: pd.DataFrame, column: str = "Risk level"):
+    """Colour the risk-level cells of a dataframe for st.dataframe."""
+    return frame.style.map(lambda value: RISK_CELL_STYLES.get(value, ""), subset=[column])
+
+
+def deadline_text(due_at: str | None, now: str, status: str) -> str:
+    """Time remaining or overdue, measured in scenario time. Terminal exceptions stop the clock."""
+    if not due_at:
+        return "—"
+    if status in {"RESOLVED", "OVERRIDDEN"}:
+        return "Closed"
+    seconds = int((datetime.fromisoformat(due_at) - datetime.fromisoformat(now)).total_seconds())
+    return f"{_short_duration(seconds)} left" if seconds >= 0 else f"OVERDUE by {_short_duration(-seconds)}"
+
+
+def _short_duration(seconds: int) -> str:
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def program_snapshot() -> dict:
     program = row("SELECT * FROM programs WHERE program_id='PROG-001'")
     account = row("SELECT * FROM bank_accounts WHERE program_id='PROG-001'")
     settings = get_settings()
     sim_time = get_runtime("simulation_time")
-    event_pending = row("SELECT COUNT(*) AS n FROM processed_events WHERE result_status='PENDING_MATCH'")["n"]
+    event_pending = row(
+        """SELECT COUNT(DISTINCT middleware_txn_id) AS n
+           FROM processed_events WHERE result_status='PENDING_MATCH'"""
+    )["n"]
     bank_pending = row(
         """SELECT COUNT(*) AS n FROM bank_transactions bank
            WHERE bank.status='POSTED'
@@ -136,6 +194,24 @@ def program_snapshot() -> dict:
     aggregate_exposure = row("SELECT COALESCE(MAX(ABS(amount_difference)),0) AS total FROM exceptions WHERE exception_type='AGGREGATE_BALANCE_MISMATCH' AND status IN ('OPEN','INVESTIGATING')")["total"]
     exposure = max(float(transaction_exposure or 0), float(aggregate_exposure or 0))
     oldest = row("SELECT created_at FROM exceptions WHERE status IN ('OPEN','INVESTIGATING') ORDER BY created_at LIMIT 1")
+    by_level = {
+        item["risk_level"]: item
+        for item in rows(
+            """SELECT risk_level, COUNT(*) AS n, COALESCE(SUM(amount_difference),0) AS amount,
+                      SUM(CASE WHEN due_at < ? THEN 1 ELSE 0 END) AS overdue
+               FROM exceptions WHERE status IN ('OPEN','INVESTIGATING') GROUP BY risk_level""",
+            (sim_time,),
+        )
+    }
+    risk_levels = {
+        level: {
+            "count": int(by_level.get(level, {}).get("n") or 0),
+            "amount": float(by_level.get(level, {}).get("amount") or 0),
+            "overdue": int(by_level.get(level, {}).get("overdue") or 0),
+        }
+        for level in RISK_LEVELS
+    }
+    checkpoint = row("SELECT * FROM daily_checkpoints ORDER BY rowid DESC LIMIT 1")
     if not program["last_heartbeat_at"]:
         health, heartbeat_age = "AWAITING_HEARTBEAT", None
     else:
@@ -154,7 +230,22 @@ def program_snapshot() -> dict:
         "ledger_difference": float(batch["aggregate_difference"]) if batch and batch["aggregate_difference"] is not None else None,
         "exposure": float(exposure or 0),
         "oldest": oldest["created_at"] if oldest else None, "feed_health": health, "heartbeat_age": heartbeat_age,
+        "risk_levels": risk_levels, "overdue": sum(item["overdue"] for item in risk_levels.values()),
+        "checkpoint": checkpoint,
     }
+
+
+def risk_level_cards(snapshot: dict) -> None:
+    """Unresolved exceptions by risk level, shown apart from the overall program status."""
+    columns = st.columns(len(RISK_LEVELS))
+    for column, level in zip(columns, RISK_LEVELS):
+        item = snapshot["risk_levels"][level]
+        overdue = f" · <b style='display:inline;font-size:.85rem;color:#b42335'>{item['overdue']} overdue</b>" if item["overdue"] else ""
+        column.markdown(
+            f'<div class="risk-card {level}"><small>{level} risk</small><b>{item["count"]}</b>'
+            f'<span>${item["amount"]:,.2f} unresolved{overdue}</span></div>',
+            unsafe_allow_html=True,
+        )
 
 
 def restriction_banner(snapshot: dict) -> None:

@@ -7,16 +7,20 @@ import pandas as pd
 
 from . import DB_PATH, SCENARIO_DIR
 from .audit import log
+from .config import format_duration
 from .db import get_runtime, set_runtime, transaction
 from .reconciliation import process_transaction, reconcile_pending
-from .risk_engine import get_settings_from_conn, monitor_feed
+from .risk_engine import get_settings_from_conn, monitor_feed, run_daily_checkpoint
 from .seed import reset_database
 
 
+SCENARIO_NAMES = {"normal", "risk_levels", "overdue", "lockdown", "timing_difference", "feed_failure"}
+
+
 def load_scenario(name: str, db_path=DB_PATH) -> None:
-    if name not in {"normal", "discrepancy", "feed_failure", "timing_difference"}:
+    if name not in SCENARIO_NAMES:
         raise ValueError(f"Unknown scenario: {name}")
-    reset_database(db_path, name)
+    reset_database(db_path, name, preserve_configuration=True)
 
 
 def scenario_events(name: str) -> list[dict]:
@@ -189,6 +193,14 @@ def process_next(db_path=DB_PATH) -> dict:
                 )
                 log(conn, "HEARTBEAT_RECEIVED", f"Valid heartbeat {event['event_id']} received.", now, event["program_id"])
                 result = "HEARTBEAT_RECEIVED"
+            elif event["event_type"] == "DAILY_CHECKPOINT":
+                # Scheduled end-of-day control in the scenario timeline, not a Synapse message.
+                result = "CHECKPOINT_" + run_daily_checkpoint(conn, now, "SYSTEM (scheduled end of day)", event["program_id"])["outcome"]
+                conn.execute(
+                    """INSERT INTO processed_events(event_id,event_type,event_timestamp,program_id,result_status,processed_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (event["event_id"], event["event_type"], event["event_timestamp"], event["program_id"], result, now),
+                )
             else:
                 result = process_transaction(conn, event, now)
 
@@ -223,3 +235,107 @@ def process_next(db_path=DB_PATH) -> dict:
 
         set_runtime("stream_state", "COMPLETE", conn)
         return {"done": True, "event": None, "result": "COMPLETE", "time": current_time}
+
+
+def _expected_balance(conn, end_user_id: str) -> float:
+    item = conn.execute(
+        "SELECT expected_balance FROM expected_customer_balances WHERE program_id='PROG-001' AND end_user_id=?",
+        (end_user_id,),
+    ).fetchone()
+    return float(item["expected_balance"]) if item else 0.0
+
+
+def simulate_customer_transfer(
+    end_user_id: str,
+    amount: float,
+    direction: str,
+    bank_outcome: str = "same",
+    bank_amount: float | None = None,
+    db_path=DB_PATH,
+    actor="DEMO USER",
+) -> dict:
+    """Walk one customer transfer through the full flow at the current scenario time.
+
+    1. The customer moves money in the fintech app.
+    2. Synapse records it and sends LedgerWatch a middleware event.
+    3. The money movement separately reaches the bank's FBO account (or does not).
+    4. LedgerWatch matches the event to the bank posting.
+    """
+    if bank_outcome not in {"same", "different", "none"}:
+        raise ValueError(f"Unknown bank outcome: {bank_outcome}")
+    with transaction(db_path) as conn:
+        if get_runtime_from_conn(conn, "stream_state") == "RUNNING":
+            raise ValueError("Pause scenario playback before simulating a transfer.")
+        now = get_runtime_from_conn(conn, "simulation_time")
+        number = conn.execute(
+            "SELECT COUNT(*) AS n FROM processed_events WHERE event_id LIKE 'SIM-EVT-%'"
+        ).fetchone()["n"] + 1
+        reference = f"SIM-{number:04d}"
+        before = _expected_balance(conn, end_user_id)
+        change = amount if direction == "CREDIT" else -amount
+        event = {
+            "event_id": f"SIM-EVT-{number:04d}", "event_type": "TRANSACTION", "event_timestamp": now,
+            "program_id": "PROG-001", "middleware_txn_id": reference, "end_user_id": end_user_id,
+            "bank_account_id": "FBO-001", "amount": f"{amount:.2f}", "direction": direction,
+            "customer_balance": f"{before + change:.2f}",
+        }
+        verb = "deposited" if direction == "CREDIT" else "withdrew"
+        log(
+            conn, "CUSTOMER_TRANSFER_SIMULATED",
+            f"{end_user_id} {verb} ${amount:,.2f} in the fintech app; Synapse sent event {event['event_id']} with reference {reference}.",
+            now, actor=actor,
+        )
+        event_result = process_transaction(conn, event, now)
+
+        bank_txn_id = None
+        if bank_outcome != "none":
+            bank_txn_id = f"BTX-SIM-{number:04d}"
+            posted_amount = amount if bank_outcome == "same" else float(bank_amount)
+            conn.execute(
+                "INSERT INTO bank_transactions VALUES (?, 'PROG-001', 'FBO-001', ?, ?, ?, 'SCHEDULED', ?)",
+                (bank_txn_id, reference, posted_amount, direction, now),
+            )
+            _promote_scheduled_bank_records(conn, now)
+            reconcile_pending(conn, now)
+
+        processed = conn.execute(
+            "SELECT result_status, match_deadline_at FROM processed_events WHERE event_id=?", (event["event_id"],)
+        ).fetchone()
+        bank = conn.execute("SELECT * FROM bank_transactions WHERE bank_txn_id=?", (bank_txn_id,)).fetchone() if bank_txn_id else None
+        exception = conn.execute(
+            "SELECT exception_id, exception_type, risk_level, due_at FROM exceptions WHERE middleware_txn_id=? ORDER BY rowid DESC",
+            (reference,),
+        ).fetchone()
+        return {
+            "time": now, "end_user_id": end_user_id, "amount": amount, "direction": direction,
+            "event_id": event["event_id"], "reference": reference,
+            "event_result": event_result, "final_result": processed["result_status"],
+            "match_deadline_at": processed["match_deadline_at"],
+            "bank": dict(bank) if bank else None,
+            "balance_before": before, "balance_after": _expected_balance(conn, end_user_id),
+            "exception": dict(exception) if exception else None,
+        }
+
+
+def advance_clock(seconds: int, db_path=DB_PATH, actor="DEMO USER") -> str:
+    """Move scenario time forward after playback so resolution deadlines can pass."""
+    with transaction(db_path) as conn:
+        if get_runtime_from_conn(conn, "stream_state") == "RUNNING":
+            raise ValueError("Pause scenario playback before advancing the clock.")
+        scenario = get_runtime_from_conn(conn, "scenario", "normal")
+        if int(get_runtime_from_conn(conn, "playback_position", "0")) < len(scenario_events(scenario)):
+            raise ValueError("Finish scenario playback before advancing the clock.")
+        current = datetime.fromisoformat(get_runtime_from_conn(conn, "simulation_time"))
+        now = (current + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+        set_runtime("simulation_time", now, conn)
+        # Outside the feed-failure demo, the middleware keeps sending heartbeats while time passes.
+        if scenario != "feed_failure":
+            conn.execute(
+                "UPDATE programs SET last_heartbeat_at=? WHERE program_id='PROG-001' AND last_heartbeat_at IS NOT NULL",
+                (now,),
+            )
+        _promote_scheduled_bank_records(conn, now)
+        reconcile_pending(conn, now)
+        monitor_feed(conn, now)
+        log(conn, "SCENARIO_TIME_ADVANCED", f"Scenario clock advanced by {format_duration(seconds)} to {now}.", now, actor=actor)
+        return now

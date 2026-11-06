@@ -59,7 +59,20 @@ CREATE TABLE IF NOT EXISTS exceptions (
     created_at TEXT NOT NULL,
     due_at TEXT NOT NULL,
     resolved_at TEXT,
-    resolution_notes TEXT
+    resolution_notes TEXT,
+    risk_level TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    program_id TEXT NOT NULL,
+    run_at TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    exposure REAL NOT NULL,
+    unresolved_count INTEGER NOT NULL,
+    overdue_count INTEGER NOT NULL,
+    breached_rules TEXT NOT NULL,
+    outcome TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -173,6 +186,10 @@ def transaction(db_path: str | Path = DB_PATH):
 def init_db(db_path: str | Path = DB_PATH) -> None:
     with transaction(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Databases created before risk levels existed lack this column.
+        columns = {item["name"] for item in conn.execute("PRAGMA table_info(exceptions)").fetchall()}
+        if "risk_level" not in columns:
+            conn.execute("ALTER TABLE exceptions ADD COLUMN risk_level TEXT")
 
 
 def rows(query: str, params=(), db_path: str | Path = DB_PATH) -> list[dict]:

@@ -1,7 +1,7 @@
 import streamlit as st
 
 from ledgerwatch.audit import log
-from ledgerwatch.config import format_duration
+from ledgerwatch.config import RISK_LEVELS, format_duration, risk_band_text
 from ledgerwatch.db import get_runtime, get_settings, row, transaction
 from ledgerwatch.risk_engine import resume_program_with_override
 from ledgerwatch.ui import configure_page, page_header, program_snapshot, restriction_banner
@@ -45,15 +45,45 @@ with st.form("settings_form"):
                 int(settings["heartbeat_critical_seconds"] / 60),
             ),
         )
-        max_open_age_hours = st.number_input(
-            "Maximum open exception age (hours)",
-            min_value=1,
-            value=max(1, int(settings["max_open_exception_age_seconds"] / 3600)),
-            help="An exception that remains OPEN beyond this limit restricts the program. INVESTIGATING exceptions are excluded.",
+        st.markdown("**Resolution deadlines by risk level (hours)**")
+        st.caption(
+            "Each deadline is fixed when the exception is created and keeps running while it is OPEN or INVESTIGATING. "
+            "A missed deadline restricts the program at the next daily checkpoint."
         )
+        deadline_hours = {
+            level: st.number_input(
+                f"{level} risk",
+                min_value=1,
+                value=max(1, int(settings[f"deadline_{level.lower()}_seconds"] / 3600)),
+                key=f"deadline_{level}",
+            )
+            for level in RISK_LEVELS
+        }
 
     with exposure_col:
-        st.markdown("**Exposure controls (USD)**")
+        st.markdown("**Risk level bands, per exception (USD)**")
+        st.caption(
+            f"Levels one exception by its own amount. Currently {risk_band_text(settings)}. "
+            "Feed exceptions are levelled by type. New bands apply to exceptions created after saving."
+        )
+        medium_from = st.number_input(
+            "Medium risk from",
+            min_value=0.01,
+            value=float(settings["risk_medium_amount"]),
+            step=100.0,
+        )
+        critical_from = st.number_input(
+            "Critical risk from",
+            min_value=float(medium_from) + 0.01,
+            value=max(float(medium_from) + 0.01, float(settings["risk_critical_amount"])),
+            step=100.0,
+        )
+
+        st.markdown("**Exposure controls, whole program (USD)**")
+        st.caption(
+            "Uses the total of all unresolved exceptions, not any single one. Warning and high-risk change the live program label. "
+            "Restriction exposure and exception count are only applied at the daily checkpoint."
+        )
         warning = st.number_input(
             "Warning exposure",
             min_value=0.0,
@@ -67,13 +97,13 @@ with st.form("settings_form"):
             step=100.0,
         )
         restriction = st.number_input(
-            "Restriction exposure",
+            "Daily checkpoint: restriction exposure",
             min_value=float(high),
             value=max(float(high), float(settings["restriction_discrepancy_amount"])),
             step=100.0,
         )
         count = st.number_input(
-            "Maximum confirmed exception count",
+            "Daily checkpoint: maximum unresolved exception count",
             min_value=1,
             value=int(settings["max_confirmed_exception_count"]),
         )
@@ -94,7 +124,9 @@ with st.form("settings_form"):
             "match_grace_seconds": int(grace_minutes) * 60,
             "heartbeat_warning_seconds": int(heartbeat_warning_minutes) * 60,
             "heartbeat_critical_seconds": int(heartbeat_critical_minutes) * 60,
-            "max_open_exception_age_seconds": int(max_open_age_hours) * 3600,
+            **{f"deadline_{level.lower()}_seconds": int(hours) * 3600 for level, hours in deadline_hours.items()},
+            "risk_medium_amount": float(medium_from),
+            "risk_critical_amount": float(critical_from),
             "warning_discrepancy_amount": warning,
             "high_discrepancy_amount": high,
             "restriction_discrepancy_amount": restriction,
@@ -151,9 +183,17 @@ policy_summary = [
     {"Control": "Match grace period", "Configured value": format_duration(settings["match_grace_seconds"])},
     {"Control": "Heartbeat warning", "Configured value": format_duration(settings["heartbeat_warning_seconds"])},
     {"Control": "Heartbeat critical failure", "Configured value": format_duration(settings["heartbeat_critical_seconds"])},
-    {"Control": "Maximum open exception age", "Configured value": format_duration(settings["max_open_exception_age_seconds"])},
-    {"Control": "Warning exposure", "Configured value": f"${settings['warning_discrepancy_amount']:,.2f}"},
-    {"Control": "High-risk exposure", "Configured value": f"${settings['high_discrepancy_amount']:,.2f}"},
-    {"Control": "Restriction exposure", "Configured value": f"${settings['restriction_discrepancy_amount']:,.2f}"},
+    {"Control": "Risk level · Medium from (per exception)", "Configured value": f"${settings['risk_medium_amount']:,.2f}"},
+    {"Control": "Risk level · Critical from (per exception)", "Configured value": f"${settings['risk_critical_amount']:,.2f}"},
+    *[
+        {"Control": f"Resolution deadline · {level} risk", "Configured value": format_duration(settings[f"deadline_{level.lower()}_seconds"])}
+        for level in RISK_LEVELS
+    ],
+    {"Control": "Warning exposure (live label)", "Configured value": f"${settings['warning_discrepancy_amount']:,.2f}"},
+    {"Control": "High-risk exposure (live label)", "Configured value": f"${settings['high_discrepancy_amount']:,.2f}"},
+    {"Control": "Daily checkpoint: missed resolution deadline", "Configured value": "Any unresolved exception past its deadline"},
+    {"Control": "Daily checkpoint: restriction exposure", "Configured value": f"${settings['restriction_discrepancy_amount']:,.2f}"},
+    {"Control": "Daily checkpoint: unresolved exception count", "Configured value": str(settings["max_confirmed_exception_count"])},
+    {"Control": "Immediate restriction", "Configured value": "Critical feed failure only"},
 ]
 st.dataframe(policy_summary, width="stretch", hide_index=True)
