@@ -20,7 +20,7 @@ from ledgerwatch.ui import configure_page, page_header, program_snapshot, restri
 
 
 role = configure_page("Reconciliation")
-page_header("Independent verification", "Reconciliation", "Replay both real-time feeds, roll forward Evolve-calculated customer balances, and reconcile the received EOD beneficial-owner batch.")
+page_header("Independent verification", "Reconciliation", "Monitor real-time matching, Evolve control records and daily controls.")
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 
@@ -33,12 +33,12 @@ SCENARIOS = {
     "6 · Synapse feed failure": "feed_failure",
 }
 SCENARIO_NOTES = {
-    "normal": "Three Synapse events each match an Evolve bank posting. No exceptions.",
-    "risk_levels": "Three separate discrepancies: a \\$200 amount mismatch (Low), a \\$1,500 transfer Evolve never receives (Medium) and a \\$6,000 transfer Evolve records in the wrong direction (Critical). No restriction.",
-    "overdue": "One \\$5,000 transfer Evolve never receives (Critical, 4 hours to resolve). The clock jumps to 13:00, 14:00 and 14:30 so you can watch the time remaining run out and turn OVERDUE. No checkpoint runs, so the program is not locked.",
-    "lockdown": "Same Critical exception, left unresolved past its deadline. The scheduled 17:00 checkpoint restricts the program and pauses playback. Resume to see a later \\$125 transfer blocked and Evolve's posting rejected.",
-    "timing_difference": "A \\$700 event waits for its Evolve posting, which arrives within the 5-minute grace period and matches.",
-    "feed_failure": "Synapse heartbeats stop. A stale-feed warning, then a feed failure that restricts the program immediately.",
+    "normal": "One 1:1 match and one two-event grouped match; no exceptions.",
+    "risk_levels": "Low \\$200, Medium \\$1,500 and Critical \\$6,000 discrepancies; no restriction.",
+    "overdue": "A Critical \\$5,000 missing transfer becomes overdue; no checkpoint runs.",
+    "lockdown": "The 17:00 checkpoint restricts service; a later \\$125 transfer is blocked.",
+    "timing_difference": "A \\$700 event matches within the five-minute grace period.",
+    "feed_failure": "Heartbeats stop; feed failure restricts the program immediately.",
 }
 
 control_left, control_right = st.columns([2.2, 1])
@@ -57,10 +57,9 @@ with control_left:
     )
     selected_scenario = SCENARIOS[selected_label]
     current_label = next(label for label, value in SCENARIOS.items() if value == current_scenario)
-    st.caption(SCENARIO_NOTES[selected_scenario])
     st.caption(
-        f"Currently loaded: **{current_label}**. **Start** and **Next event / deadline** load the selected scenario first "
-        "if it is not the loaded one, and **Start** replays a finished scenario from the beginning."
+        f"{SCENARIO_NOTES[selected_scenario]} Currently loaded: **{current_label}**. "
+        "Start and Next auto-load the selected scenario."
     )
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     if c1.button("Load scenario", width="stretch"):
@@ -85,89 +84,13 @@ with control_left:
     if c6.button("Reset", width="stretch"):
         load_scenario(get_runtime("scenario", "normal"))
         st.rerun()
-    st.caption("Automatic playback uses a fixed presentation cadence. Manual advance moves to the next Synapse event, Evolve bank posting or control deadline.")
 with control_right:
     st.subheader("Simulation state")
     stream_state = get_runtime("stream_state", "READY")
     st.markdown(status_badge(stream_state), unsafe_allow_html=True)
     scenario_time = get_runtime("simulation_time", "—")
     st.metric("Scenario time", scenario_time.replace("T", " ") if scenario_time != "—" else "—")
-    st.caption("This is the business timeline being fast-forwarded; it is independent of the presentation delay.")
-
-st.divider()
-st.subheader("Simulate a customer transfer")
-st.caption(
-    "Shows where Synapse events come from. A customer moves money in the fintech app, Synapse records it and "
-    "sends LedgerWatch an event, the money separately reaches Evolve's FBO account, and LedgerWatch matches the two. "
-    "Runs at the current scenario time."
-)
-customers = [item["end_user_id"] for item in rows("SELECT end_user_id FROM expected_customer_balances ORDER BY end_user_id")]
-BANK_OUTCOMES = {
-    "Same amount (should match)": "same",
-    "A different amount": "different",
-    "Nothing yet (Evolve posting missing)": "none",
-}
-with st.form("simulate_transfer"):
-    t1, t2, t3, t4 = st.columns(4)
-    sim_user = t1.selectbox("Customer", customers)
-    sim_kind = t2.selectbox("Transfer in the fintech app", ["Deposit into wallet", "Withdrawal from wallet"])
-    sim_amount = t3.number_input("Amount (USD)", min_value=0.01, value=50.0, step=10.0, format="%.2f")
-    sim_outcome = t4.selectbox("What reaches Evolve", list(BANK_OUTCOMES))
-    sim_bank_amount = st.number_input(
-        "Evolve amount, if different (USD)", min_value=0.01, value=40.0, step=10.0, format="%.2f",
-        help="Only used when 'A different amount' is selected.",
-    )
-    if st.form_submit_button("Simulate transfer", type="primary", disabled=stream_state == "RUNNING"):
-        try:
-            st.session_state["last_transfer"] = simulate_customer_transfer(
-                sim_user, float(sim_amount),
-                "CREDIT" if sim_kind.startswith("Deposit") else "DEBIT",
-                BANK_OUTCOMES[sim_outcome], float(sim_bank_amount), actor=role,
-            )
-            st.rerun()
-        except ValueError as error:
-            st.error(str(error))
-if stream_state == "RUNNING":
-    st.caption("Pause playback to simulate a transfer.")
-
-transfer = st.session_state.get("last_transfer")
-if transfer:
-    verb = "deposits" if transfer["direction"] == "CREDIT" else "withdraws"
-    bank = transfer["bank"]
-    exc = transfer["exception"]
-    if transfer["event_result"] == "BLOCKED_BY_RESTRICTION":
-        event_text, event_class = "Program is restricted, so the event is kept as evidence but blocked.", "fail"
-    else:
-        event_text, event_class = "No Evolve posting with this reference yet, so the event waits: PENDING_MATCH.", "wait"
-    if not bank:
-        bank_title, bank_text, bank_class = "No posting received", "The money never reached the FBO account.", "fail"
-    elif bank["status"] == "REJECTED_BY_RESTRICTION":
-        bank_title, bank_text, bank_class = bank["bank_txn_id"], f"${bank['amount']:,.2f} {bank['direction']} rejected because the program is restricted. FBO balance unchanged.", "fail"
-    else:
-        different = abs(float(bank["amount"]) - transfer["amount"]) > 0.001
-        bank_title = bank["bank_txn_id"]
-        bank_text = f"${bank['amount']:,.2f} {bank['direction']} posted to {bank['account_id']} with reference {bank['middleware_reference']}."
-        bank_class = "fail" if different else ""
-    final = transfer["final_result"]
-    if final == "MATCHED":
-        match_text, match_class = f"Same reference, amount, direction and account. {transfer['end_user_id']} expected balance ${transfer['balance_before']:,.2f} → ${transfer['balance_after']:,.2f}.", ""
-    elif final == "CONFIRMED_EXCEPTION" and exc:
-        match_text, match_class = f"{exc['exception_type']} raised as {exc['risk_level']} risk; resolve by {exc['due_at'].replace('T', ' ')}. Expected balance unchanged.", "fail"
-    elif final == "PENDING_MATCH":
-        match_text, match_class = f"Still waiting. Becomes MISSING_BANK_TRANSACTION if nothing posts by {transfer['match_deadline_at'].replace('T', ' ')}. Use Next event / deadline or Advance clock.", "wait"
-    else:
-        match_text, match_class = "Not matched. Neither the FBO balance nor the expected balance changed.", "fail"
-    steps = [
-        ("", "1 · Fintech app", f"{transfer['end_user_id']} {verb} ${transfer['amount']:,.2f}", "The customer moves money in the app. Nothing has reached Evolve yet."),
-        (event_class, "2 · Synapse event received", f"{transfer['event_id']} · ref {transfer['reference']}", f"Received {transfer['time'].replace('T', ' ')}. {event_text}"),
-        (bank_class, "3 · Evolve bank posting", bank_title, bank_text),
-        (match_class, "4 · LedgerWatch matching", final, match_text),
-    ]
-    for column, (css, label, title, text) in zip(st.columns(4), steps):
-        column.markdown(f'<div class="flow-step {css}"><small>{label}</small><b>{title}</b><p>{text}</p></div>', unsafe_allow_html=True)
-
-st.divider()
-st.subheader("Live Synapse event stream")
+st.subheader("Live event stream")
 events = rows(
     """SELECT event_timestamp, event_type, middleware_txn_id, end_user_id, amount, direction,
               customer_balance, result_status, bank_txn_id
@@ -180,26 +103,40 @@ if events:
         "customer_balance": "Event-reported resulting balance (informational)", "result_status": "Result",
         "bank_txn_id": "Evolve record",
     })
-    st.dataframe(frame, width="stretch", hide_index=True, column_config={
+    st.dataframe(frame, width="stretch", hide_index=True, height=245, column_config={
         "Amount": st.column_config.NumberColumn(format="$%.2f"),
         "Event-reported resulting balance (informational)": st.column_config.NumberColumn(format="$%.2f"),
     })
-    st.caption("The event-reported balance is retained as evidence but never overwrites the Evolve-calculated expected balances or the immutable EOD snapshot.")
+    st.caption("Event-reported balances are evidence only; they never overwrite Evolve's balances or the EOD snapshot.")
 else:
     st.info("Load and start a scenario to replay events.")
 
 pending = [
     {
-        "waiting_for": "Evolve transaction",
+        "waiting_for": item["waiting_for"],
         "reference": item["middleware_txn_id"],
-        "amount": item["amount"],
+        "events": item["event_count"],
+        "amount": item["group_total"],
         "direction": item["direction"],
-        "first_seen": item["event_timestamp"],
-        "deadline": item["match_deadline_at"],
+        "first_seen": item["first_seen"],
+        "deadline": item["deadline"],
     }
     for item in rows(
-        """SELECT middleware_txn_id, amount, direction, event_timestamp, match_deadline_at
-           FROM processed_events WHERE result_status='PENDING_MATCH'"""
+        """SELECT event.middleware_txn_id,
+                  COUNT(*) AS event_count,
+                  SUM(event.amount) AS group_total,
+                  MIN(event.direction) AS direction,
+                  MIN(event.event_timestamp) AS first_seen,
+                  MIN(event.match_deadline_at) AS deadline,
+                  CASE WHEN EXISTS (
+                      SELECT 1 FROM bank_transactions bank
+                      WHERE bank.middleware_reference=event.middleware_txn_id
+                        AND bank.status='POSTED'
+                  ) THEN 'Additional Synapse event(s)'
+                  ELSE 'Evolve transaction' END AS waiting_for
+           FROM processed_events event
+           WHERE event.result_status='PENDING_MATCH'
+           GROUP BY event.middleware_txn_id"""
     )
 ]
 bank_first = rows(
@@ -222,6 +159,7 @@ pending.extend(
     {
         "waiting_for": "Synapse event",
         "reference": item["middleware_reference"],
+        "events": 0,
         "amount": item["amount"],
         "direction": item["direction"],
         "first_seen": item["posted_at"],
@@ -232,10 +170,10 @@ pending.extend(
 if pending:
     st.subheader("Two-way pending matches")
     pframe = pd.DataFrame(pending).rename(columns={
-        "waiting_for": "Waiting for", "reference": "Reference", "amount": "Amount",
+        "waiting_for": "Waiting for", "reference": "Reference", "events": "Events", "amount": "Event total / bank amount",
         "direction": "Direction", "first_seen": "First seen", "deadline": "Grace expires",
     })
-    st.dataframe(pframe, width="stretch", hide_index=True, column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+    st.dataframe(pframe, width="stretch", hide_index=True, column_config={"Event total / bank amount": st.column_config.NumberColumn(format="$%.2f")})
 
 blocked = rows(
     """SELECT event_timestamp, middleware_txn_id, end_user_id, amount, direction
@@ -252,7 +190,7 @@ if blocked:
     st.dataframe(blocked_frame, width="stretch", hide_index=True, column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
 
 st.divider()
-st.subheader("Real-time Evolve control records")
+st.subheader("Real-time Evolve records")
 source_left, source_right = st.columns(2)
 with source_left:
     st.markdown("**Evolve-calculated expected customer balances**")
@@ -265,9 +203,9 @@ with source_left:
         "end_user_id": "End user", "expected_balance": "Expected balance",
         "last_matched_event_id": "Last Evolve-matched event", "updated_at": "Updated at",
     })
-    st.dataframe(expected_frame, width="stretch", hide_index=True, column_config={"Expected balance": st.column_config.NumberColumn(format="$%.2f")})
+    st.dataframe(expected_frame, width="stretch", hide_index=True, height=220, column_config={"Expected balance": st.column_config.NumberColumn(format="$%.2f")})
     st.metric("Expected total", f"${snapshot['expected_total']:,.2f}")
-    st.caption("Updated in real time only by transactions that exactly match Evolve's bank records.")
+    st.caption("Updated only after an exact reference-group match.")
 with source_right:
     st.markdown("**Evolve bank transaction feed (independent)**")
     bank_rows = rows(
@@ -284,13 +222,78 @@ with source_right:
             "amount": "Amount", "direction": "Direction", "status": "Evolve status",
             "posted_at": "Evolve decision time",
         })
-        st.dataframe(bank_frame, width="stretch", hide_index=True, column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+        st.dataframe(bank_frame, width="stretch", hide_index=True, height=220, column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
     else:
         st.info("No Evolve bank transactions have posted or been rejected yet.")
-    st.metric("Evolve FBO ledger", f"${snapshot['account']['ledger_balance']:,.2f}")
+    st.metric("Evolve FBO account balance", f"${snapshot['account']['ledger_balance']:,.2f}")
+
+with st.expander("Simulate a customer transfer"):
+    customers = [item["end_user_id"] for item in rows("SELECT end_user_id FROM expected_customer_balances ORDER BY end_user_id")]
+    BANK_OUTCOMES = {
+        "Same amount (should match)": "same",
+        "A different amount": "different",
+        "Nothing yet (Evolve posting missing)": "none",
+    }
+    st.caption("Create one customer transfer at the current scenario time. Pause playback first.")
+    with st.form("simulate_transfer"):
+        t1, t2, t3, t4 = st.columns(4)
+        sim_user = t1.selectbox("Customer", customers)
+        sim_kind = t2.selectbox("Fintech transfer", ["Deposit into wallet", "Withdrawal from wallet"])
+        sim_amount = t3.number_input("Amount (USD)", min_value=0.01, value=50.0, step=10.0, format="%.2f")
+        sim_outcome = t4.selectbox("Evolve outcome", list(BANK_OUTCOMES))
+        sim_bank_amount = st.number_input(
+            "Different Evolve amount (USD)", min_value=0.01, value=40.0, step=10.0, format="%.2f",
+            help="Used only for 'A different amount'.",
+        )
+        if st.form_submit_button("Simulate transfer", type="primary", disabled=stream_state == "RUNNING"):
+            try:
+                st.session_state["last_transfer"] = simulate_customer_transfer(
+                    sim_user, float(sim_amount),
+                    "CREDIT" if sim_kind.startswith("Deposit") else "DEBIT",
+                    BANK_OUTCOMES[sim_outcome], float(sim_bank_amount), actor=role,
+                )
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+
+    transfer = st.session_state.get("last_transfer")
+    if transfer:
+        verb = "deposits" if transfer["direction"] == "CREDIT" else "withdraws"
+        bank = transfer["bank"]
+        exc = transfer["exception"]
+        if transfer["event_result"] == "BLOCKED_BY_RESTRICTION":
+            event_text, event_class = "Restricted: event retained but blocked.", "fail"
+        else:
+            event_text, event_class = "Event received and evaluated for matching.", "wait"
+        if not bank:
+            bank_title, bank_text, bank_class = "No posting", "Nothing reached the FBO account.", "fail"
+        elif bank["status"] == "REJECTED_BY_RESTRICTION":
+            bank_title, bank_text, bank_class = bank["bank_txn_id"], "Rejected; FBO unchanged.", "fail"
+        else:
+            different = abs(float(bank["amount"]) - transfer["amount"]) > 0.001
+            bank_title = bank["bank_txn_id"]
+            bank_text = f"${bank['amount']:,.2f} {bank['direction']} · {bank['middleware_reference']}"
+            bank_class = "fail" if different else ""
+        final = transfer["final_result"]
+        if final == "MATCHED":
+            match_text, match_class = f"{transfer['end_user_id']}: ${transfer['balance_before']:,.2f} → ${transfer['balance_after']:,.2f}", ""
+        elif final == "CONFIRMED_EXCEPTION" and exc:
+            match_text, match_class = f"{exc['exception_type']} · {exc['risk_level']} · due {exc['due_at'].replace('T', ' ')}", "fail"
+        elif final == "PENDING_MATCH":
+            match_text, match_class = f"Waiting until {transfer['match_deadline_at'].replace('T', ' ')}", "wait"
+        else:
+            match_text, match_class = "No balance update.", "fail"
+        steps = [
+            ("", "1 · Fintech", f"{transfer['end_user_id']} {verb} ${transfer['amount']:,.2f}", "Customer instruction"),
+            (event_class, "2 · Synapse", transfer["event_id"], event_text),
+            (bank_class, "3 · Evolve", bank_title, bank_text),
+            (match_class, "4 · LedgerWatch", final, match_text),
+        ]
+        for column, (css, label, title, text) in zip(st.columns(4), steps):
+            column.markdown(f'<div class="flow-step {css}"><small>{label}</small><b>{title}</b><p>{text}</p></div>', unsafe_allow_html=True)
 
 st.divider()
-st.subheader("EOD beneficial-owner batch and daily reconciliation")
+st.subheader("EOD batch reconciliation")
 batch = snapshot["batch"]
 batch_actions = st.columns([1, 1, 2])
 with batch_actions[0]:

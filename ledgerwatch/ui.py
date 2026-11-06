@@ -161,7 +161,10 @@ def program_snapshot() -> dict:
     account = row("SELECT * FROM bank_accounts WHERE program_id='PROG-001'")
     settings = get_settings()
     sim_time = get_runtime("simulation_time")
-    event_pending = row("SELECT COUNT(*) AS n FROM processed_events WHERE result_status='PENDING_MATCH'")["n"]
+    event_pending = row(
+        """SELECT COUNT(DISTINCT middleware_txn_id) AS n
+           FROM processed_events WHERE result_status='PENDING_MATCH'"""
+    )["n"]
     bank_pending = row(
         """SELECT COUNT(*) AS n FROM bank_transactions bank
            WHERE bank.status='POSTED'

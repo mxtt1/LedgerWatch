@@ -6,6 +6,7 @@ import pandas as pd
 
 from . import BATCH_DIR
 from .audit import log
+from .config import OWNER_RECONCILIATION
 from .risk_engine import create_exception, evaluate_risk, get_settings_from_conn, reclassify_exception
 
 
@@ -32,18 +33,150 @@ def _insert_processed(
     )
 
 
-def _mismatch(bank, event) -> tuple[str | None, float]:
-    if bank["program_id"] != event["program_id"] or bank["account_id"] != event["bank_account_id"]:
-        return "ACCOUNT_MISMATCH", float(event["amount"])
-    if abs(float(bank["amount"]) - float(event["amount"])) > 0.001:
-        return "AMOUNT_MISMATCH", abs(float(bank["amount"]) - float(event["amount"]))
-    if bank["direction"] != event["direction"]:
-        return "DIRECTION_MISMATCH", float(event["amount"])
-    return None, 0.0
+def _create_group_exception(conn, events, bank, exception_type: str, impact: float, now: str) -> None:
+    """Create one exception for a reference and attach every event in the group to it."""
+    reference = events[0]["middleware_txn_id"]
+    create_exception(
+        conn,
+        exception_type,
+        impact,
+        now,
+        program_id=events[0]["program_id"],
+        middleware_txn_id=reference,
+        bank_txn_id=bank["bank_txn_id"] if bank else None,
+    )
+    conn.execute(
+        """UPDATE processed_events
+           SET result_status='CONFIRMED_EXCEPTION', bank_txn_id=?
+           WHERE event_type='TRANSACTION' AND middleware_txn_id=?
+             AND result_status='PENDING_MATCH'""",
+        (bank["bank_txn_id"] if bank else None, reference),
+    )
+
+
+def _reconcile_reference(conn, reference: str, now: str) -> str:
+    """Match every pending customer event for one reference to one bank transaction."""
+    events = conn.execute(
+        """SELECT * FROM processed_events
+           WHERE event_type='TRANSACTION' AND middleware_txn_id=?
+             AND result_status='PENDING_MATCH'
+           ORDER BY event_timestamp, rowid""",
+        (reference,),
+    ).fetchall()
+    if not events:
+        return "NO_PENDING_EVENTS"
+
+    previously_matched = conn.execute(
+        """SELECT COUNT(*) AS count FROM processed_events
+           WHERE event_type='TRANSACTION' AND middleware_txn_id=?
+             AND result_status='MATCHED'""",
+        (reference,),
+    ).fetchone()["count"]
+    if previously_matched:
+        _create_group_exception(
+            conn, events, None, "AMOUNT_MISMATCH",
+            sum(float(event["amount"]) for event in events), now,
+        )
+        log(
+            conn,
+            "REFERENCE_REUSED_AFTER_MATCH",
+            f"{reference} received {len(events)} additional event(s) after its bank transaction had already matched.",
+            now,
+            events[0]["program_id"],
+        )
+        return "CONFIRMED_EXCEPTION"
+
+    bank = conn.execute(
+        "SELECT * FROM bank_transactions WHERE middleware_reference=? AND status='POSTED'",
+        (reference,),
+    ).fetchone()
+    group_total = sum(float(event["amount"]) for event in events)
+    deadline = min(datetime.fromisoformat(event["match_deadline_at"]) for event in events)
+    current = datetime.fromisoformat(now)
+
+    if not bank:
+        if current >= deadline:
+            _create_group_exception(conn, events, None, "MISSING_BANK_TRANSACTION", group_total, now)
+            log(
+                conn,
+                "EVENT_GROUP_UNMATCHED",
+                f"{reference}: {len(events)} intermediary event(s) totaling ${group_total:,.2f} had no bank transaction by {deadline.isoformat(timespec='seconds')}.",
+                now,
+                events[0]["program_id"],
+            )
+            return "CONFIRMED_EXCEPTION"
+        return "PENDING_MATCH"
+
+    if any(
+        event["program_id"] != bank["program_id"] or event["bank_account_id"] != bank["account_id"]
+        for event in events
+    ):
+        _create_group_exception(conn, events, bank, "ACCOUNT_MISMATCH", group_total, now)
+        return "CONFIRMED_EXCEPTION"
+
+    directions = {event["direction"] for event in events}
+    if directions != {bank["direction"]}:
+        _create_group_exception(conn, events, bank, "DIRECTION_MISMATCH", group_total, now)
+        return "CONFIRMED_EXCEPTION"
+
+    difference = float(bank["amount"]) - group_total
+    if abs(difference) <= 0.001:
+        for event in events:
+            _apply_expected_balance(conn, event, now)
+        conn.execute(
+            """UPDATE processed_events
+               SET result_status='MATCHED', bank_txn_id=?
+               WHERE event_type='TRANSACTION' AND middleware_txn_id=?
+                 AND result_status='PENDING_MATCH'""",
+            (bank["bank_txn_id"], reference),
+        )
+        late_exception = conn.execute(
+            """SELECT exception_id FROM exceptions
+               WHERE exception_type='MISSING_INTERMEDIARY_EVENT' AND bank_txn_id=?
+                 AND status IN ('OPEN','INVESTIGATING')""",
+            (bank["bank_txn_id"],),
+        ).fetchone()
+        if late_exception:
+            conn.execute(
+                """UPDATE exceptions SET status='RESOLVED', resolved_at=?,
+                   resolution_notes='Late intermediary event group arrived and matched the bank transaction.'
+                   WHERE exception_id=?""",
+                (now, late_exception["exception_id"]),
+            )
+            log(
+                conn,
+                "EXCEPTION_RESOLVED",
+                f"{late_exception['exception_id']} resolved when intermediary event group {reference} matched {bank['bank_txn_id']}.",
+                now,
+                events[0]["program_id"],
+            )
+        log(
+            conn,
+            "TRANSACTION_GROUP_MATCHED",
+            f"{reference}: {len(events)} intermediary event(s) totaling ${group_total:,.2f} matched {bank['bank_txn_id']}; customer balances rolled forward.",
+            now,
+            events[0]["program_id"],
+        )
+        return "MATCHED"
+
+    # A smaller event total may still be completed by another event carrying the
+    # same reference. Once the grace period expires, the remaining difference is confirmed.
+    if group_total < float(bank["amount"]) and current < deadline:
+        return "PENDING_MATCH"
+
+    _create_group_exception(conn, events, bank, "AMOUNT_MISMATCH", abs(difference), now)
+    log(
+        conn,
+        "TRANSACTION_GROUP_MISMATCH",
+        f"{reference}: {len(events)} intermediary event(s) total ${group_total:,.2f}; {bank['bank_txn_id']} is ${float(bank['amount']):,.2f}.",
+        now,
+        events[0]["program_id"],
+    )
+    return "CONFIRMED_EXCEPTION"
 
 
 def _apply_expected_balance(conn, event, now: str) -> None:
-    """Roll forward the bank-calculated customer balance after an exact bank match."""
+    """Roll forward one customer's balance after its reference group matches the bank."""
     amount = float(event["amount"])
     change = amount if event["direction"] == "CREDIT" else -amount
     existing = conn.execute(
@@ -92,85 +225,40 @@ def process_transaction(conn, event: dict, now: str) -> str:
         return "BLOCKED_BY_RESTRICTION"
 
     bank = conn.execute(
-        "SELECT * FROM bank_transactions WHERE middleware_reference = ? AND status = 'POSTED'",
+        "SELECT * FROM bank_transactions WHERE middleware_reference=? AND status='POSTED'",
         (event["middleware_txn_id"],),
     ).fetchone()
-
-    if not bank:
-        settings = get_settings_from_conn(conn)
-        expires = (datetime.fromisoformat(now) + timedelta(seconds=int(settings["match_grace_seconds"]))).isoformat(timespec="seconds")
-        _insert_processed(
-            conn, event, "PENDING_MATCH", now,
-            match_deadline_at=expires,
-        )
-        log(conn, "PENDING_MATCH_CREATED", f"{event['middleware_txn_id']} awaiting a bank record until {expires}.", now, event["program_id"])
-        return "PENDING_MATCH"
-
-    mismatch_type, difference = _mismatch(bank, event)
-
-    if mismatch_type:
-        create_exception(conn, mismatch_type, difference, now, middleware_txn_id=event["middleware_txn_id"], bank_txn_id=bank["bank_txn_id"])
-        _insert_processed(conn, event, "CONFIRMED_EXCEPTION", now, bank["bank_txn_id"])
-        evaluate_risk(conn, now, event["program_id"])
-        return "CONFIRMED_EXCEPTION"
-
-    _apply_expected_balance(conn, event, now)
-    _insert_processed(conn, event, "MATCHED", now, bank["bank_txn_id"])
-    late_exception = conn.execute(
-        """SELECT exception_id FROM exceptions
-           WHERE exception_type='MISSING_INTERMEDIARY_EVENT' AND bank_txn_id=?
-             AND status IN ('OPEN','INVESTIGATING')""",
-        (bank["bank_txn_id"],),
-    ).fetchone()
-    if late_exception:
-        conn.execute(
-            """UPDATE exceptions SET status='RESOLVED', resolved_at=?,
-               resolution_notes='Late intermediary event arrived and matched the bank transaction.'
-               WHERE exception_id=?""",
-            (now, late_exception["exception_id"]),
-        )
-        log(conn, "EXCEPTION_RESOLVED", f"{late_exception['exception_id']} resolved by late matching intermediary event.", now, event["program_id"])
-    log(conn, "TRANSACTION_MATCHED", f"{event['middleware_txn_id']} matched {bank['bank_txn_id']}; expected customer balance rolled forward.", now, event["program_id"])
+    settings = get_settings_from_conn(conn)
+    first_seen = min(
+        datetime.fromisoformat(now),
+        datetime.fromisoformat(bank["posted_at"]) if bank else datetime.fromisoformat(now),
+    )
+    expires = (first_seen + timedelta(seconds=int(settings["match_grace_seconds"]))).isoformat(timespec="seconds")
+    _insert_processed(conn, event, "PENDING_MATCH", now, match_deadline_at=expires)
+    log(
+        conn,
+        "PENDING_MATCH_CREATED",
+        f"{event['event_id']} joined reference {event['middleware_txn_id']}; group remains open until matched or {expires}.",
+        now,
+        event["program_id"],
+    )
+    _reconcile_reference(conn, event["middleware_txn_id"], now)
+    result = conn.execute(
+        "SELECT result_status FROM processed_events WHERE event_id=?",
+        (event["event_id"],),
+    ).fetchone()["result_status"]
     evaluate_risk(conn, now, event["program_id"])
-    return "MATCHED"
+    return result
 
 
 def reconcile_pending(conn, now: str, program_id: str = "PROG-001") -> None:
     current = datetime.fromisoformat(now)
-    for pending in conn.execute("SELECT * FROM processed_events WHERE result_status='PENDING_MATCH'").fetchall():
-        bank = conn.execute(
-            "SELECT * FROM bank_transactions WHERE middleware_reference = ? AND status = 'POSTED'",
-            (pending["middleware_txn_id"],),
-        ).fetchone()
-        if bank:
-            mismatch_type, difference = _mismatch(bank, pending)
-            if mismatch_type:
-                create_exception(
-                    conn, mismatch_type, difference, now,
-                    program_id=pending["program_id"], middleware_txn_id=pending["middleware_txn_id"],
-                    bank_txn_id=bank["bank_txn_id"],
-                )
-                conn.execute(
-                    """UPDATE processed_events SET result_status='CONFIRMED_EXCEPTION',
-                       bank_txn_id=? WHERE event_id=?""",
-                    (bank["bank_txn_id"], pending["event_id"]),
-                )
-            else:
-                _apply_expected_balance(conn, pending, now)
-                conn.execute(
-                    "UPDATE processed_events SET result_status='MATCHED', bank_txn_id=? WHERE event_id=?",
-                    (bank["bank_txn_id"], pending["event_id"]),
-                )
-                log(conn, "TRANSACTION_MATCHED", f"{pending['middleware_txn_id']} matched {bank['bank_txn_id']} within grace period; expected customer balance rolled forward.", now, program_id)
-        elif current >= datetime.fromisoformat(pending["match_deadline_at"]):
-            create_exception(
-                conn, "MISSING_BANK_TRANSACTION", pending["amount"], now,
-                program_id=pending["program_id"], middleware_txn_id=pending["middleware_txn_id"],
-            )
-            conn.execute(
-                "UPDATE processed_events SET result_status='CONFIRMED_EXCEPTION' WHERE event_id=?",
-                (pending["event_id"],),
-            )
+    references = conn.execute(
+        """SELECT DISTINCT middleware_txn_id FROM processed_events
+           WHERE event_type='TRANSACTION' AND result_status='PENDING_MATCH'"""
+    ).fetchall()
+    for item in references:
+        _reconcile_reference(conn, item["middleware_txn_id"], now)
 
     settings = get_settings_from_conn(conn)
     grace = timedelta(seconds=int(settings["match_grace_seconds"]))
@@ -322,13 +410,22 @@ def formal_reconciliation(conn, now: str, actor: str = "DEMO USER", program_id: 
             "SELECT exception_id FROM exceptions WHERE exception_type='AGGREGATE_BALANCE_MISMATCH' AND status IN ('OPEN','INVESTIGATING')"
         ).fetchone()
         if existing:
+            exception_id = existing["exception_id"]
             conn.execute(
                 "UPDATE exceptions SET resolution_notes=? WHERE exception_id=?",
-                (f"Latest failed batch: {batch['batch_id']}", existing["exception_id"]),
+                (f"Latest failed batch: {batch['batch_id']}", exception_id),
             )
-            reclassify_exception(conn, existing["exception_id"], control_exposure, now)
+            reclassify_exception(conn, exception_id, control_exposure, now)
         else:
-            create_exception(conn, "AGGREGATE_BALANCE_MISMATCH", control_exposure, now, program_id=program_id, owner="Reconciliation Analyst")
+            exception_id = create_exception(conn, "AGGREGATE_BALANCE_MISMATCH", control_exposure, now, program_id=program_id, owner=OWNER_RECONCILIATION)
+        log(
+            conn,
+            "EXCEPTION_EVIDENCE_LINKED",
+            f"{exception_id}: reconciliation batch {batch['batch_id']} failed with bank-minus-batch ${aggregate_difference:,.2f} and {mismatches} customer mismatch(es).",
+            now,
+            program_id,
+            actor,
+        )
         evaluate_risk(conn, now, program_id)
 
     return {

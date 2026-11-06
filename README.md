@@ -2,7 +2,7 @@
 
 LedgerWatch is a synthetic bank-side Banking-as-a-Service assurance prototype. It demonstrates these controls:
 
-1. real-time matching between middleware transaction events and the bank's independent transaction feed;
+1. real-time many-to-one matching between customer-level middleware events and the bank's independent transaction feed;
 2. a bank-calculated expected customer-balance table that rolls forward only after a bank match;
 3. end-of-day customer-level and aggregate reconciliation against an immutable balance batch received from the middleware provider;
 4. Low / Medium / Critical risk levels for individual exceptions, each with a configurable resolution deadline; and
@@ -50,7 +50,7 @@ LedgerWatch deliberately keeps these records separate:
 
 The bank-calculated expected customer-balance table **is updated in real time**. A middleware event alone cannot change it. The corresponding independent bank transaction must have posted and matched. The `customer_balance` included in a live middleware event is displayed as evidence but never overwrites the bank-calculated table or the EOD batch.
 
-The bank transaction is the source of truth for cash movement, while the middleware event identifies the end user associated with that movement. LedgerWatch joins `middleware_txn_id` on the event to `middleware_reference` on the bank transaction, then checks the amount, direction, program, and account. The separate event is needed in this prototype because the independent bank feed does not contain an end-user ID.
+The bank transaction is the source of truth for cash movement, while each middleware event identifies an end user associated with that movement. Multiple events may carry the same Synapse reference and correspond to one aggregate bank transaction. LedgerWatch groups events by `middleware_txn_id`, joins that value to `middleware_reference` on the bank transaction, and compares the summed event amount, direction, program, and account. On a match, every customer event in the group rolls forward its customer's expected balance. The separate events are needed because the independent bank feed does not contain end-user IDs.
 
 The mocked EOD batch represents the customer-level balance file received from Synapse (the middleware provider). It is not a continuously updated Synapse ledger on the dashboard. Once received, its rows are immutable for that scenario run.
 
@@ -74,7 +74,7 @@ The form chooses what reaches the bank: the same amount (matches), a different a
 5. Select **Run daily reconciliation**.
 6. Optionally use **Advance clock 4 hours** / **Advance clock 1 day** so resolution deadlines pass, then select **Run daily risk checkpoint**.
 
-Loading a scenario resets SQLite to deterministic opening data and loads that scenario's real-time feed, independent bank records, and EOD batch definition. **Reset** restarts the currently loaded scenario; it does not select a different scenario.
+Loading a scenario resets its transactions, exceptions, balances, batches and audit state to deterministic opening data while retaining the saved control policy and automatic-restriction toggle. It then loads that scenario's real-time feed, independent bank records and EOD batch definition. **Reset** restarts the currently loaded scenario; it does not select a different scenario or restore policy defaults.
 
 The application does not impose a presentation timer or automatically change pages. **Next event / deadline** has no real-time limit, so the presenter can explain each state before continuing.
 
@@ -84,7 +84,7 @@ The scenarios are numbered in demo order. Each one shows a single idea.
 
 | # | Scenario | What it shows | EOD reconciliation result |
 |---|---|---|---|
-| 1 | Normal operation | Both arrival orders: an Evolve posting that waits for its Synapse event, and a Synapse event that waits for its Evolve posting. All match within the grace period. No exceptions | Evolve FBO, expected total and Synapse batch all `$10,000`; all customers match |
+| 1 | Normal operation | Both arrival orders plus many-to-one matching: one Evolve posting waits for its Synapse event, while two customer events sharing `NORM-1002` total `$500` and match one `$500` Evolve transaction. No exceptions | Evolve FBO, expected total and Synapse batch all `$10,000`; all customers match |
 | 2 | Risk levels | Three separate discrepancies, one per level: a `$200` amount mismatch (**Low**), a `$1,500` transfer Evolve never receives (**Medium**) and a `$6,000` transfer Evolve records in the wrong direction (**Critical**). Exposure `$7,700` sets the label to `HIGH_RISK`; nothing is restricted | Evolve FBO `$4,600`, expected `$10,000`, Synapse `$17,900`; three customer mismatches and a Critical aggregate exception |
 | 3 | Missed resolution deadline | One `$5,000` transfer Evolve never receives (Critical, 4 hours to resolve, due 14:05:30). The scenario clock jumps to 13:00 (1h 5m left), 14:00 (5m left) and 14:30 (**OVERDUE**). No checkpoint runs, so the program is overdue but **not** locked | Evolve FBO and expected `$10,000`, Synapse `$15,000`; one customer mismatch |
 | 4 | Lockdown at the daily checkpoint | The same Critical exception left unresolved past its deadline. The scheduled **17:00 daily checkpoint** applies the missed-deadline rule and **restricts** the program, which pauses playback. Select **Resume**: a later `$125` transfer is `BLOCKED_BY_RESTRICTION` and Evolve's posting is `REJECTED_BY_RESTRICTION` | Evolve FBO and expected `$10,000`, Synapse `$15,000`; one customer mismatch |
@@ -123,9 +123,9 @@ Default prototype thresholds are editable under **Configuration & service contro
 
 | Condition | Initial result | Confirmed exception |
 |---|---|---|
-| No matching bank transaction | `PENDING_MATCH` | `MISSING_BANK_TRANSACTION` after the five-minute grace period |
+| One or more events have no matching bank transaction | The reference group remains `PENDING_MATCH` | One `MISSING_BANK_TRANSACTION` for the group after the five-minute grace period |
 | Posted bank transaction has no matching intermediary event | Two-way pending match | `MISSING_INTERMEDIARY_EVENT` after the same five-minute grace period |
-| Amount differs from the bank record | Immediate | `AMOUNT_MISMATCH` |
+| Grouped event total differs from the bank record | Waits when additional events could complete the total; otherwise immediate | One `AMOUNT_MISMATCH` for the reference group no later than grace expiry |
 | Direction differs | Immediate | `DIRECTION_MISMATCH` |
 | FBO account or program differs | Immediate | `ACCOUNT_MISMATCH` |
 | Required event data is missing or invalid | Immediate | Record is marked `INPUT_REJECTED` and audited; no workflow exception is created |
@@ -135,7 +135,7 @@ Default prototype thresholds are editable under **Configuration & service contro
 
 Exceptions use exactly four statuses: `OPEN`, `INVESTIGATING`, `RESOLVED`, and `OVERRIDDEN`.
 
-Matching is two-way and uses the same configured grace period in both directions. Intermediary-first pending state is stored on the processed event. Bank-first pending state is derived from the posted bank transaction and the absence of a corresponding event, so no separate pending-match table is required.
+Matching is two-way and uses the same configured grace period in both directions. All pending intermediary events with the same Synapse reference are treated as one group and compared with one bank transaction carrying that reference. A successful group match updates every affected customer's expected balance; a failed group creates one exception rather than one exception per event. Intermediary-first pending state is stored on the processed events. Bank-first pending state is derived from the posted bank transaction and the absence of corresponding events, so no separate pending-match table is required.
 
 Heartbeat monitoring does not reconcile stale data. It prevents a silent or unavailable intermediary feed from being mistaken for a successfully reconciled period. Previously completed matches remain visible, but the current real-time control is not reliable again until the feed resumes.
 
@@ -212,13 +212,13 @@ The acting-role selector contains exactly three roles:
 - **Risk / Compliance** represents the reviewer assessing exposure, exceptions, and control evidence.
 - **Management** is the only role allowed to resume a restricted program. Resumption requires a rationale and changes all unresolved exceptions to `OVERRIDDEN`.
 
-`Reconciliation Analyst` is available as an exception owner, but it is not an acting role in the sidebar. There is no separate Auditor role in the current UI. Apart from Management-only service resumption, the selector primarily records who performed an action in the audit trail; it is not authentication or a complete authorization system.
+Exceptions are assigned to named synthetic staff members—Maya Chen (Reconciliation Analyst), Jordan Lee (Operations), Priya Shah (Risk / Compliance), or Elena Ruiz (Management)—so ownership identifies one accountable person rather than an entire function. These names are illustrative and do not represent real employees. There is no separate Auditor role in the current UI. Apart from Management-only service resumption, the acting-role selector primarily records who performed an action in the audit trail; it is not authentication or a complete authorization system.
 
 ## Screens
 
 - **Dashboard** — FBO balance, real-time bank-calculated expected balances, latest Synapse batch state, bank transaction feed, blocked evidence, feed health, risk metrics, exceptions by risk level, and the last daily checkpoint.
 - **Reconciliation** — scenario playback, customer-transfer simulator, real-time matching, pending/blocked evidence, expected balances, bank transactions, EOD batch receipt, customer comparison, aggregate reconciliation, clock controls and the daily risk checkpoint.
-- **Exception management** — risk-level summary, filters, ownership, investigation, resolution deadlines with time remaining, resolution, and audit history.
+- **Exception management** — risk-level summary, filters, ownership, linked Synapse events and Evolve record, exception-specific evidence log, resolution deadlines with time remaining, resolution, and full audit history.
 - **Configuration & service controls** — editable thresholds, automatic restriction, audit trail, and Management-only resumption.
 
 ## Resetting

@@ -20,7 +20,7 @@ SCENARIO_NAMES = {"normal", "risk_levels", "overdue", "lockdown", "timing_differ
 def load_scenario(name: str, db_path=DB_PATH) -> None:
     if name not in SCENARIO_NAMES:
         raise ValueError(f"Unknown scenario: {name}")
-    reset_database(db_path, name)
+    reset_database(db_path, name, preserve_configuration=True)
 
 
 def scenario_events(name: str) -> list[dict]:

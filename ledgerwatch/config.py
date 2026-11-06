@@ -32,6 +32,19 @@ RISK_LEVELS = ("Critical", "Medium", "Low")
 # Feed exceptions carry no amount, so their level comes from the exception type.
 FEED_RISK_LEVELS = {"STALE_FEED": "Medium", "FEED_FAILURE": "Critical"}
 
+# Synthetic staff used to demonstrate individual ownership and accountability.
+OWNER_RECONCILIATION = "Maya Chen — Reconciliation Analyst"
+OWNER_OPERATIONS = "Jordan Lee — Operations"
+OWNER_RISK = "Priya Shah — Risk / Compliance"
+OWNER_MANAGEMENT = "Elena Ruiz — Management"
+EXCEPTION_OWNERS = (
+    "Unassigned",
+    OWNER_RECONCILIATION,
+    OWNER_OPERATIONS,
+    OWNER_RISK,
+    OWNER_MANAGEMENT,
+)
+
 
 def risk_level_for(exception_type: str, amount: float, settings: dict) -> str:
     """Level one exception by its own amount, using the configured bands (lower bound inclusive)."""

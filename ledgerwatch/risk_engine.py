@@ -6,6 +6,7 @@ from uuid import uuid4
 from .audit import log
 from .config import (
     FINANCIAL_EXCEPTION_TYPES,
+    OWNER_RISK,
     UNRESOLVED_STATUSES,
     deadline_seconds_for,
     feed_health,
@@ -70,7 +71,9 @@ def create_exception(
         (exception_id, program_id, exception_type, middleware_txn_id, bank_txn_id, abs(float(amount_difference)), owner, now, due_at, risk_level),
     )
     detail = (
-        f"{exception_type} created; impact ${abs(float(amount_difference)):,.2f}; "
+        f"{exception_id}: {exception_type} created; "
+        f"Synapse reference {middleware_txn_id or 'none'}; bank record {bank_txn_id or 'none'}; "
+        f"impact ${abs(float(amount_difference)):,.2f}; "
         f"{risk_level} risk; resolve within {format_duration(allowed)} (by {due_at})."
     )
     log(conn, "EXCEPTION_CREATED", detail, now, program_id)
@@ -287,14 +290,14 @@ def monitor_feed(conn, now: str, program_id: str = "PROG-001") -> str:
             (program_id,),
         ).fetchone()
         if not exists:
-            create_exception(conn, "STALE_FEED", 0, now, program_id=program_id, owner="Risk / Compliance")
+            create_exception(conn, "STALE_FEED", 0, now, program_id=program_id, owner=OWNER_RISK)
     elif health == "CRITICAL":
         exists = conn.execute(
             "SELECT 1 FROM exceptions WHERE program_id = ? AND exception_type = 'FEED_FAILURE' AND status IN ('OPEN','INVESTIGATING')",
             (program_id,),
         ).fetchone()
         if not exists:
-            create_exception(conn, "FEED_FAILURE", 0, now, program_id=program_id, owner="Risk / Compliance")
+            create_exception(conn, "FEED_FAILURE", 0, now, program_id=program_id, owner=OWNER_RISK)
         restrict_program(
             conn,
             f"Critical feed failure: no heartbeat for {format_duration(age)}; configured threshold {format_duration(settings['heartbeat_critical_seconds'])}.",
