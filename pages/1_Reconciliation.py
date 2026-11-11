@@ -20,7 +20,7 @@ from ledgerwatch.ui import configure_page, page_header, program_snapshot, restri
 
 
 role = configure_page("Reconciliation")
-page_header("Independent verification", "Reconciliation", "Monitor real-time matching, Evolve control records and daily controls.")
+page_header("Independent verification", "Reconciliation")
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 
@@ -57,10 +57,7 @@ with control_left:
     )
     selected_scenario = SCENARIOS[selected_label]
     current_label = next(label for label, value in SCENARIOS.items() if value == current_scenario)
-    st.caption(
-        f"{SCENARIO_NOTES[selected_scenario]} Currently loaded: **{current_label}**. "
-        "Start and Next auto-load the selected scenario."
-    )
+    st.caption(f"{SCENARIO_NOTES[selected_scenario]} Loaded: **{current_label}**.")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     if c1.button("Load scenario", width="stretch"):
         load_scenario(selected_scenario)
@@ -107,7 +104,6 @@ if events:
         "Amount": st.column_config.NumberColumn(format="$%.2f"),
         "Event-reported resulting balance (informational)": st.column_config.NumberColumn(format="$%.2f"),
     })
-    st.caption("Event-reported balances are evidence only; they never overwrite Evolve's balances or the EOD snapshot.")
 else:
     st.info("Load and start a scenario to replay events.")
 
@@ -205,7 +201,6 @@ with source_left:
     })
     st.dataframe(expected_frame, width="stretch", hide_index=True, height=220, column_config={"Expected balance": st.column_config.NumberColumn(format="$%.2f")})
     st.metric("Expected total", f"${snapshot['expected_total']:,.2f}")
-    st.caption("Updated only after an exact reference-group match.")
 with source_right:
     st.markdown("**Evolve bank transaction feed (independent)**")
     bank_rows = rows(
@@ -234,7 +229,6 @@ with st.expander("Simulate a customer transfer"):
         "A different amount": "different",
         "Nothing yet (Evolve posting missing)": "none",
     }
-    st.caption("Create one customer transfer at the current scenario time. Pause playback first.")
     with st.form("simulate_transfer"):
         t1, t2, t3, t4 = st.columns(4)
         sim_user = t1.selectbox("Customer", customers)
@@ -328,7 +322,6 @@ if batch:
     st.markdown("**Synapse-reported beneficial-owner snapshot**")
     reported_frame = pd.DataFrame(reported_rows).rename(columns={"end_user_id": "End user", "reported_balance": "EOD reported balance"})
     st.dataframe(reported_frame, width="stretch", hide_index=True, column_config={"EOD reported balance": st.column_config.NumberColumn(format="$%.2f")})
-    st.caption("These immutable rows came from the mocked EOD batch; live Synapse events cannot change them.")
 
     if batch["status"] == "RECONCILED":
         result_metrics = st.columns(5)
@@ -362,8 +355,8 @@ if batch:
 st.divider()
 st.subheader("Daily risk checkpoint")
 st.caption(
-    "Live monitoring detects, classifies and tracks exceptions, but does not restrict the program for amounts or counts. "
-    "Restriction is decided here, once per business day, by applying the rules below. A critical feed failure still restricts immediately."
+    "Amount, count and overdue rules are enforced only when this checkpoint runs. "
+    "A critical feed failure is evaluated immediately; restriction still depends on the automatic-restriction setting."
 )
 playback_done = int(get_runtime("playback_position", "0")) >= len(scenario_events(current_scenario))
 with transaction() as conn:
