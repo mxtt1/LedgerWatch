@@ -1,27 +1,20 @@
 import streamlit as st
 
 from ledgerwatch.audit import log
-from ledgerwatch.config import RISK_LEVELS, format_duration, risk_band_text
+from ledgerwatch.config import RISK_LEVELS, format_duration
 from ledgerwatch.db import get_runtime, get_settings, row, transaction
 from ledgerwatch.risk_engine import resume_program_with_override
 from ledgerwatch.ui import configure_page, page_header, program_snapshot, restriction_banner
 
 
 role = configure_page("Configuration")
-page_header(
-    "Risk controls",
-    "Configuration & service controls",
-    "Adjust illustrative business-time policies and manage a restricted program through role-gated controls.",
-)
+page_header("Risk controls", "Configuration & service controls")
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 settings = get_settings()
 
 st.subheader("Threshold policy")
-st.caption(
-    "These values are illustrative prototype controls—not legal requirements or actual thresholds used by any named institution. "
-    "Playback fast-forwards through this business timeline."
-)
+st.caption("Illustrative prototype controls—not legal requirements or thresholds used by any named institution.")
 
 with st.form("settings_form"):
     time_col, exposure_col = st.columns(2)
@@ -62,10 +55,6 @@ with st.form("settings_form"):
 
     with exposure_col:
         st.markdown("**Risk level bands, per exception (USD)**")
-        st.caption(
-            f"Levels one exception by its own amount. Currently {risk_band_text(settings)}. "
-            "Feed exceptions are levelled by type. New bands apply to exceptions created after saving."
-        )
         medium_from = st.number_input(
             "Medium risk from",
             min_value=0.01,

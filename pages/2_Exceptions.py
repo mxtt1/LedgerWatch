@@ -21,11 +21,7 @@ from ledgerwatch.ui import (
 
 
 role = configure_page("Exceptions")
-page_header(
-    "Owned investigation",
-    "Exception management",
-    "Assign, investigate and resolve confirmed control failures with a complete evidence trail.",
-)
+page_header("Owned investigation", "Exception management")
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 
@@ -37,7 +33,6 @@ st.caption(
     "a stale feed is Medium and a feed failure is Critical. "
     "The resolution deadline keeps running while an exception is OPEN or INVESTIGATING."
 )
-st.write("")
 
 f1, f2, f3 = st.columns(3)
 status_filter = f1.multiselect(
@@ -170,7 +165,7 @@ else:
         else []
     )
     with evidence_left:
-        st.caption("Linked Synapse events")
+        st.markdown("**Linked Synapse events**")
         if linked_events:
             event_frame = pd.DataFrame(linked_events).rename(columns={
                 "event_id": "Event",
@@ -191,7 +186,7 @@ else:
         else:
             st.info("This exception has no linked transaction events.")
     with evidence_right:
-        st.caption("Linked Evolve bank transaction")
+        st.markdown("**Linked Evolve bank transaction**")
         if bank:
             bank_frame = pd.DataFrame([{
                 "Bank transaction": bank["bank_txn_id"],
@@ -227,7 +222,7 @@ else:
             ORDER BY rowid DESC LIMIT 50""",
         (exc["program_id"], *evidence_params),
     )
-    st.caption("Relevant evidence log entries")
+    st.markdown("**Relevant evidence log entries**")
     if relevant_audit:
         audit_frame = pd.DataFrame(relevant_audit).rename(columns={
             "created_at": "Time", "event_type": "Event", "actor": "Actor", "details": "Evidence",

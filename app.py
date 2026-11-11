@@ -7,7 +7,7 @@ from ledgerwatch.ui import audit_table, configure_page, page_header, program_sna
 
 
 configure_page("Dashboard")
-page_header("Program oversight", "Control room", "Independent visibility into Synapse records, Evolve's own bank transactions, daily beneficial-owner controls and service risk.")
+page_header("Bank-side assurance", "Programme overview")
 snapshot = program_snapshot()
 restriction_banner(snapshot)
 
@@ -15,54 +15,73 @@ program = snapshot["program"]
 account = snapshot["account"]
 batch = snapshot["batch"]
 
-left, right = st.columns([2, 1])
-with left:
+identity, state = st.columns([3, 1])
+with identity:
     st.subheader(program["program_name"])
-    st.caption(f"Fintech program  ·  via {program['middleware_name']}  ·  held at {account['account_name']} ({account['account_id']}, {account['currency']})")
-with right:
-    st.markdown("**Program state**")
+    st.markdown(
+        f"**Middleware:** {program['middleware_name']} &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"**Evolve account:** {account['account_id']} &nbsp;&nbsp;|&nbsp;&nbsp; **Currency:** {account['currency']}"
+    )
+with state:
+    st.markdown("**Programme state**")
     st.markdown(status_badge(program["status"]), unsafe_allow_html=True)
 
-st.subheader("Daily beneficial-owner control")
-control_metrics = st.columns(4)
-control_metrics[0].metric("Evolve FBO ledger", f"${account['ledger_balance']:,.2f}")
-control_metrics[1].metric("Evolve-calculated expected balances", f"${snapshot['expected_total']:,.2f}")
-control_metrics[2].metric("Latest Synapse batch", f"${snapshot['reported_total']:,.2f}" if batch else "Not received")
-control_metrics[3].metric("Daily reconciliation", batch["outcome"] if batch and batch["outcome"] else ("Batch received" if batch else "Awaiting batch"))
+st.subheader("Balance assurance")
+balance_metrics = st.columns(3)
+balance_metrics[0].metric("Cash at Evolve (FBO account)", f"${account['ledger_balance']:,.2f}")
+balance_metrics[1].metric("Customer total calculated by Evolve", f"${snapshot['expected_total']:,.2f}")
+balance_metrics[2].metric(
+    "Customer total reported by Synapse (EOD)",
+    f"${snapshot['reported_total']:,.2f}" if batch else "Not received",
+)
 
 if not batch:
-    st.info("No current EOD beneficial-owner batch has been received. Expected balances are rolling forward from the prior validated opening snapshot using only transactions matched to Evolve's bank records.")
+    st.info("EOD batch not received. Real-time matching remains active; daily reconciliation has not run.")
 elif batch["status"] == "RECEIVED":
-    st.info(f"Batch {batch['batch_id']} was received for {batch['as_of']} and is awaiting daily reconciliation.")
+    st.info(f"EOD batch {batch['batch_id']} was received and is awaiting reconciliation.")
 elif batch["outcome"] == "MATCHED":
-    st.success(f"Batch {batch['batch_id']} reconciled with no customer-level or aggregate differences.")
+    st.success(f"EOD batch {batch['batch_id']} matched at both customer and aggregate levels.")
 else:
     st.error(
-        f"Batch {batch['batch_id']} failed daily reconciliation: "
-        f"Evolve-minus-Synapse difference ${float(batch['aggregate_difference']):,.2f}; "
-        f"{batch['customer_mismatch_count']} customer record(s) differ."
+        f"EOD reconciliation failed: Evolve minus Synapse ${float(batch['aggregate_difference']):,.2f}; "
+        f"{batch['customer_mismatch_count']} customer mismatch(es)."
     )
 
-risk_metrics = st.columns(5)
-risk_metrics[0].metric("Unresolved exposure", f"${snapshot['exposure']:,.2f}")
-risk_metrics[1].metric("Unresolved exceptions", snapshot["confirmed"])
-risk_metrics[2].metric("Past resolution deadline", snapshot["overdue"])
-risk_metrics[3].metric("Pending matches", snapshot["pending"])
-risk_metrics[4].metric("Blocked events", snapshot["blocked"])
+st.subheader("Items requiring attention")
+attention_metrics = st.columns(5)
+attention_metrics[0].metric("Unresolved exposure", f"${snapshot['exposure']:,.2f}")
+attention_metrics[1].metric("Open / investigating", snapshot["confirmed"])
+attention_metrics[2].metric("Overdue", snapshot["overdue"])
+attention_metrics[3].metric("Pending matches", snapshot["pending"])
+attention_metrics[4].metric("Blocked attempts", snapshot["blocked"])
 
-st.subheader("Individual discrepancies by risk level")
-st.caption("Each exception is levelled on its own. This is separate from the program state above, which reflects total exposure and the daily checkpoint.")
-risk_level_cards(snapshot)
+if snapshot["confirmed"]:
+    st.markdown("**Unresolved exceptions by risk level**")
+    risk_level_cards(snapshot)
+elif not snapshot["pending"]:
+    st.success("No unresolved exceptions or pending matches.")
 
 checkpoint = snapshot["checkpoint"]
 if checkpoint:
-    breached = f" Breached: {checkpoint['breached_rules']}." if checkpoint["breached_rules"] else ""
-    st.caption(
-        f"Last daily risk checkpoint: {checkpoint['run_at'].replace('T', ' ')} · outcome **{checkpoint['outcome']}** · "
-        f"exposure \\${checkpoint['exposure']:,.2f} ·{checkpoint['unresolved_count']} unresolved · {checkpoint['overdue_count']} overdue.{breached}"
+    breached = checkpoint["breached_rules"] or "None"
+    outcome_labels = {
+        "NO_RESTRICTION": "No restriction required",
+        "RESTRICTED": "Programme restricted",
+        "ALREADY_RESTRICTED": "Programme already restricted",
+        "BREACHED_AUTO_RESTRICT_OFF": "Rules breached; automatic restriction was off",
+    }
+    checkpoint_message = (
+        f"Last daily checkpoint: {checkpoint['run_at'].replace('T', ' ')} · "
+        f"{outcome_labels.get(checkpoint['outcome'], checkpoint['outcome'])} · breached rules: {breached}"
     )
+    if checkpoint["outcome"] == "NO_RESTRICTION":
+        st.success(checkpoint_message)
+    elif checkpoint["outcome"] == "BREACHED_AUTO_RESTRICT_OFF":
+        st.warning(checkpoint_message)
+    else:
+        st.error(checkpoint_message)
 else:
-    st.caption("No daily risk checkpoint has run yet. Run it from the Reconciliation page; amount, count and missed-deadline restriction is only applied there.")
+    st.info("Daily risk checkpoint not yet run for this scenario.")
 
 expected_balances = rows(
     """SELECT end_user_id, expected_balance, last_matched_event_id, updated_at
@@ -76,32 +95,31 @@ bank_transactions = rows(
        ORDER BY posted_at DESC""",
     (program["program_id"],),
 )
-ledger_left, ledger_right = st.columns(2)
-with ledger_left:
-    st.subheader("Evolve-calculated expected balances")
-    expected_frame = pd.DataFrame(expected_balances).rename(columns={
-        "end_user_id": "End user", "expected_balance": "Expected balance",
-        "last_matched_event_id": "Last Evolve-matched event", "updated_at": "Updated at",
-    })
-    st.dataframe(expected_frame, width="stretch", hide_index=True, column_config={
-        "Expected balance": st.column_config.NumberColumn(format="$%.2f")
-    })
-    st.caption("This table updates in real time only after an exact match to Evolve's bank records. It is not the Synapse-reported ledger.")
-with ledger_right:
-    st.subheader("Evolve bank transactions (independent feed)")
-    if bank_transactions:
-        bank_frame = pd.DataFrame(bank_transactions).rename(columns={
-            "bank_txn_id": "Evolve transaction", "account_id": "Evolve account",
-            "middleware_reference": "Synapse reference",
-            "amount": "Amount", "direction": "Direction", "status": "Evolve status",
-            "posted_at": "Evolve decision time",
+with st.expander("Supporting Evolve records"):
+    ledger_left, ledger_right = st.columns(2)
+    with ledger_left:
+        st.markdown("**Bank-calculated customer balances**")
+        expected_frame = pd.DataFrame(expected_balances).rename(columns={
+            "end_user_id": "End user", "expected_balance": "Expected balance",
+            "last_matched_event_id": "Last matched event", "updated_at": "Updated at",
         })
-        st.dataframe(bank_frame, width="stretch", hide_index=True, column_config={
-            "Amount": st.column_config.NumberColumn(format="$%.2f")
+        st.dataframe(expected_frame, width="stretch", hide_index=True, column_config={
+            "Expected balance": st.column_config.NumberColumn(format="$%.2f")
         })
-    else:
-        st.info("No Evolve bank transactions have posted or been rejected yet for this scenario.")
-    st.caption("Rejected transactions remain visible as evidence but never change the FBO balance. Scheduled future records remain invisible.")
+    with ledger_right:
+        st.markdown("**Independent Evolve transactions**")
+        if bank_transactions:
+            bank_frame = pd.DataFrame(bank_transactions).rename(columns={
+                "bank_txn_id": "Evolve transaction", "account_id": "Evolve account",
+                "middleware_reference": "Synapse reference",
+                "amount": "Amount", "direction": "Direction", "status": "Status",
+                "posted_at": "Decision time",
+            })
+            st.dataframe(bank_frame, width="stretch", hide_index=True, column_config={
+                "Amount": st.column_config.NumberColumn(format="$%.2f")
+            })
+        else:
+            st.info("No Evolve transactions have posted or been rejected in this scenario.")
 
 blocked_events = rows(
     """SELECT event_timestamp, middleware_txn_id, end_user_id, amount, direction, result_status
@@ -123,33 +141,26 @@ if blocked_events:
         "Amount": st.column_config.NumberColumn(format="$%.2f")
     })
 
-st.write("")
-feed_col, threshold_col = st.columns([1, 1.6])
-with feed_col:
-    st.subheader("Feed health")
-    age = "No heartbeat received" if snapshot["heartbeat_age"] is None else f"Last heartbeat {format_duration(snapshot['heartbeat_age'])} ago in scenario time"
-    st.markdown(f'<div class="info-card"><small>Current signal</small><b>{status_badge(snapshot["feed_health"])}</b><p>{age}</p></div>', unsafe_allow_html=True)
-    st.caption(
-        f"Warning after {format_duration(snapshot['settings']['heartbeat_warning_seconds'])} "
-        f"· critical after {format_duration(snapshot['settings']['heartbeat_critical_seconds'])}"
-    )
-with threshold_col:
-    st.subheader("Exposure thresholds")
-    settings = snapshot["settings"]
-    exposure = snapshot["exposure"]
-    threshold_data = pd.DataFrame([
-        {"Control level": "Warning", "Threshold": settings["warning_discrepancy_amount"], "Current exposure": exposure, "Breached": exposure >= settings["warning_discrepancy_amount"]},
-        {"Control level": "High risk", "Threshold": settings["high_discrepancy_amount"], "Current exposure": exposure, "Breached": exposure >= settings["high_discrepancy_amount"]},
-        {"Control level": "Restriction (daily checkpoint)", "Threshold": settings["restriction_discrepancy_amount"], "Current exposure": exposure, "Breached": exposure >= settings["restriction_discrepancy_amount"]},
-    ])
-    st.dataframe(threshold_data, width="stretch", hide_index=True, column_config={
-        "Threshold": st.column_config.NumberColumn(format="$%.2f"),
-        "Current exposure": st.column_config.NumberColumn(format="$%.2f"),
-        "Breached": st.column_config.CheckboxColumn(),
-    })
+with st.expander("Control monitoring details"):
+    feed_col, threshold_col = st.columns([1, 1.6])
+    with feed_col:
+        st.markdown("**Synapse feed health**")
+        age = "No heartbeat received" if snapshot["heartbeat_age"] is None else f"Last heartbeat {format_duration(snapshot['heartbeat_age'])} ago in scenario time"
+        st.markdown(f'<div class="info-card"><small>Current signal</small><b>{status_badge(snapshot["feed_health"])}</b><p>{age}</p></div>', unsafe_allow_html=True)
+    with threshold_col:
+        st.markdown("**Exposure thresholds**")
+        settings = snapshot["settings"]
+        exposure = snapshot["exposure"]
+        threshold_data = pd.DataFrame([
+            {"Control level": "Warning label", "Threshold": settings["warning_discrepancy_amount"], "Current exposure": exposure, "Breached": exposure >= settings["warning_discrepancy_amount"]},
+            {"Control level": "High-risk label", "Threshold": settings["high_discrepancy_amount"], "Current exposure": exposure, "Breached": exposure >= settings["high_discrepancy_amount"]},
+            {"Control level": "Restriction at checkpoint", "Threshold": settings["restriction_discrepancy_amount"], "Current exposure": exposure, "Breached": exposure >= settings["restriction_discrepancy_amount"]},
+        ])
+        st.dataframe(threshold_data, width="stretch", hide_index=True, column_config={
+            "Threshold": st.column_config.NumberColumn(format="$%.2f"),
+            "Current exposure": st.column_config.NumberColumn(format="$%.2f"),
+            "Breached": st.column_config.CheckboxColumn(),
+        })
 
 st.subheader("Recent control activity")
 audit_table(8)
-
-with st.expander("Control design note"):
-    st.write("Real-time expected balances and Synapse EOD batch snapshots are separate records. Daily reconciliation compares them customer by customer, then compares the batch total with Evolve's FBO balance.")

@@ -10,13 +10,40 @@ LedgerWatch is a synthetic bank-side Banking-as-a-Service assurance prototype. I
 
 The bank is labelled **Evolve Bank & Trust** and the middleware provider **Synapse**, after the Evolve–Synapse case, and the fintech program is the fictional **Northstar Wallet**. These names are used for illustration only. All customers, accounts, transactions, balances and Synapse records are synthetic. The prototype does not connect to real banking systems, payment rails, or customer data.
 
-## Setup and run
+## Contents
 
-From PowerShell:
+- [Hosted deployment](#hosted-deployment)
+- [Local setup](#local-setup)
+- [Control flow](#control-flow)
+- [Data model](#data-model)
+- [Scenarios and presentation](#scenarios-and-presentation)
+- [Matching, exceptions and restriction](#matching-exceptions-and-restriction)
+- [Limitations](#limitations)
+- [Roles and screens](#roles-and-screens)
+- [Project structure](#project-structure)
+
+## Hosted deployment
+
+The intended hosted platform is **Streamlit Community Cloud**. It deploys directly from GitHub and updates automatically when changes are pushed to the selected branch; no separate CI workflow is required.
+
+| Setting | Value |
+|---|---|
+| Repository | `mxtt1/LedgerWatch` |
+| Branch | `main` after the submitted version has been merged |
+| Main file | `app.py` |
+| Python | `3.12` |
+
+After deployment, use the generated `*.streamlit.app` URL as the technology-demonstrator link and verify it in a signed-out or incognito browser. The **Edit** control shown to repository developers opens a GitHub Codespace; ordinary viewers cannot use it to modify this repository. The `.devcontainer` directory supports that optional Codespaces environment and is not a CI or deployment script.
+
+Streamlit Community Cloud storage is ephemeral. The generated SQLite database can survive ordinary reruns but may be recreated after a reboot or redeployment. This is acceptable for the deterministic demonstrator because each scenario can be rebuilt from its tracked CSV fixtures. The hosted app should be treated as a single-presenter demonstration: all visitors share one SQLite state, and concurrent use is not supported.
+
+## Local setup
+
+Python 3.12 is recommended. From PowerShell:
 
 ```powershell
 cd <path to this LedgerWatch folder>
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
@@ -36,7 +63,27 @@ If PowerShell blocks activation:
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-## The data model
+The application creates `data/ledgerwatch.db` automatically on first launch. The generated database and local `.venv` are excluded from version control.
+
+## Control flow
+
+```text
+Fintech customer action
+        |
+        +--> Synapse customer event(s) -- shared reference --+
+        |                                                    |
+        +--> Evolve bank transaction ------------------------+--> real-time match
+                                                               |
+                                                               +--> update bank-calculated
+                                                                    customer balances
+
+Synapse EOD customer-balance batch --> customer + aggregate reconciliation
+Real-time exceptions + EOD result ----> daily risk checkpoint --> possible restriction
+```
+
+The two real-time inputs have different purposes. The Evolve transaction is evidence that money moved in the pooled FBO account. Synapse events provide the customer attribution needed to allocate that movement among beneficial owners. LedgerWatch does not treat either input alone as a complete reconciliation.
+
+## Data model
 
 LedgerWatch deliberately keeps these records separate:
 
@@ -44,9 +91,9 @@ LedgerWatch deliberately keeps these records separate:
 |---|---|---|---|
 | Middleware transaction events | Real-time scenario CSV | During playback | Supplies the middleware's customer attribution and claimed transaction details |
 | Independent bank transactions | Bank-feed CSV | At each bank `posted_at` time | Confirms what money actually moved in the pooled FBO account |
-| Bank-calculated expected customer balances | LedgerWatch/SQLite | Real time, but only after an exact or within-grace bank match | The bank's independently rolled-forward beneficial-owner expectation |
+| Bank-calculated expected customer balances | LedgerWatch/SQLite | Real time, but only after an exact match; arrival may occur within the grace period | The bank's independently rolled-forward beneficial-owner expectation |
 | Middleware-reported customer balances | EOD batch CSV | Once, after scenario completion | Immutable third-party customer-balance snapshot used for daily reconciliation |
-| Bank FBO balance | Bank ledger/SQLite | When an independent bank transaction posts | Aggregate cash position at the bank |
+| Evolve FBO account balance | Bank ledger/SQLite | When an independent bank transaction posts | Aggregate cash position at the bank |
 
 The bank-calculated expected customer-balance table **is updated in real time**. A middleware event alone cannot change it. The corresponding independent bank transaction must have posted and matched. The `customer_balance` included in a live middleware event is displayed as evidence but never overwrites the bank-calculated table or the EOD batch.
 
@@ -54,7 +101,11 @@ The bank transaction is the source of truth for cash movement, while each middle
 
 The mocked EOD batch represents the customer-level balance file received from Synapse (the middleware provider). It is not a continuously updated Synapse ledger on the dashboard. Once received, its rows are immutable for that scenario run.
 
-## Where events come from: simulate a customer transfer
+The live records use synthetic customer IDs such as `U001`. A production design would keep a separately controlled mapping between a stable customer UUID and the legal beneficial owner. That identity/KYC store is outside this prototype.
+
+## Scenarios and presentation
+
+### Customer-transfer simulator
 
 The **Simulate a customer transfer** form on the Reconciliation page walks one transfer through the whole flow at the current scenario time:
 
@@ -65,7 +116,7 @@ The **Simulate a customer transfer** form on the Reconciliation page walks one t
 
 The form chooses what reaches the bank: the same amount (matches), a different amount (`AMOUNT_MISMATCH`), or nothing (stays pending, then `MISSING_BANK_TRANSACTION` after the grace period). While the program is restricted, the event is `BLOCKED_BY_RESTRICTION` and the bank posting is `REJECTED_BY_RESTRICTION`. The simulator is disabled while playback is running.
 
-## Loading and playing a scenario
+### Loading and playing a scenario
 
 1. Open **Reconciliation** from the Streamlit sidebar.
 2. Choose a scenario.
@@ -78,18 +129,18 @@ Loading a scenario resets its transactions, exceptions, balances, batches and au
 
 The application does not impose a presentation timer or automatically change pages. **Next event / deadline** has no real-time limit, so the presenter can explain each state before continuing.
 
-## Scenario outcomes
+### Scenario outcomes
 
 The scenarios are numbered in demo order. Each one shows a single idea.
 
 | # | Scenario | What it shows | EOD reconciliation result |
 |---|---|---|---|
-| 1 | Normal operation | Both arrival orders plus many-to-one matching: one Evolve posting waits for its Synapse event, while two customer events sharing `NORM-1002` total `$500` and match one `$500` Evolve transaction. No exceptions | Evolve FBO, expected total and Synapse batch all `$10,000`; all customers match |
-| 2 | Risk levels | Three separate discrepancies, one per level: a `$200` amount mismatch (**Low**), a `$1,500` transfer Evolve never receives (**Medium**) and a `$6,000` transfer Evolve records in the wrong direction (**Critical**). Exposure `$7,700` sets the label to `HIGH_RISK`; nothing is restricted | Evolve FBO `$4,600`, expected `$10,000`, Synapse `$17,900`; three customer mismatches and a Critical aggregate exception |
-| 3 | Missed resolution deadline | One `$5,000` transfer Evolve never receives (Critical, 4 hours to resolve, due 14:05:30). The scenario clock jumps to 13:00 (1h 5m left), 14:00 (5m left) and 14:30 (**OVERDUE**). No checkpoint runs, so the program is overdue but **not** locked | Evolve FBO and expected `$10,000`, Synapse `$15,000`; one customer mismatch |
-| 4 | Lockdown at the daily checkpoint | The same Critical exception left unresolved past its deadline. The scheduled **17:00 daily checkpoint** applies the missed-deadline rule and **restricts** the program, which pauses playback. Select **Resume**: a later `$125` transfer is `BLOCKED_BY_RESTRICTION` and Evolve's posting is `REJECTED_BY_RESTRICTION` | Evolve FBO and expected `$10,000`, Synapse `$15,000`; one customer mismatch |
+| 1 | Normal operation | Both arrival orders plus many-to-one matching: one Evolve posting waits for its Synapse event, while two customer events sharing `NORM-1002` total `$500` and match one `$500` Evolve transaction. No exceptions | Evolve FBO account balance, expected total and Synapse batch all `$10,000`; all customers match |
+| 2 | Risk levels | Three separate discrepancies, one per level: a `$200` amount mismatch (**Low**), a `$1,500` transfer Evolve never receives (**Medium**) and a `$6,000` transfer Evolve records in the wrong direction (**Critical**). Exposure `$7,700` sets the label to `HIGH_RISK`; nothing is restricted | Evolve FBO account balance `$4,600`, expected `$10,000`, Synapse `$17,900`; three customer mismatches and a Critical aggregate exception |
+| 3 | Missed resolution deadline | One `$5,000` transfer Evolve never receives (Critical, 4 hours to resolve, due 14:05:30). The scenario clock jumps to 13:00 (1h 5m left), 14:00 (5m left) and 14:30 (**OVERDUE**). No checkpoint runs, so the program is overdue but **not** locked | Evolve FBO account balance and expected total `$10,000`, Synapse `$15,000`; one customer mismatch |
+| 4 | Lockdown at the daily checkpoint | The same Critical exception left unresolved past its deadline. The scheduled **17:00 daily checkpoint** applies the missed-deadline rule and **restricts** the program, which pauses playback. Select **Resume** in the playback controls (not Management service resumption): a later `$125` transfer is `BLOCKED_BY_RESTRICTION` and Evolve's posting is `REJECTED_BY_RESTRICTION` | Evolve FBO account balance and expected total `$10,000`, Synapse `$15,000`; one customer mismatch |
 | 5 | Timing difference | A `$700` event waits in `PENDING_MATCH`; the Evolve posting arrives within the five-minute grace period and rolls expected U001 to `$4,700` | All totals `$10,700`; no exception |
-| 6 | Synapse feed failure | Heartbeats stop; a `STALE_FEED` exception (Medium) at the warning timeout, then a `FEED_FAILURE` exception (Critical) that restricts the program immediately | A `$10,000` EOD batch can still match; that does not mean the real-time feed was available or clear its exceptions |
+| 6 | Synapse feed failure | Heartbeats stop; a `STALE_FEED` exception (Medium) at the warning timeout, then a `FEED_FAILURE` exception (Critical). With automatic restriction enabled—the default—the critical failure restricts the program immediately | A `$10,000` EOD batch can still match; that does not mean the real-time feed was available or clear its exceptions |
 
 Scenario CSV timestamps represent business time. Autoplay fast-forwards that timeline using a short fixed presentation delay. The matching grace period, feed thresholds and resolution deadlines use scenario minutes or hours, not wall-clock demo seconds. Scenarios 3 and 4 assume the default 4-hour Critical deadline; if you change it, the countdown points shift.
 
@@ -117,7 +168,7 @@ Transaction matching and daily reconciliation are separate controls. An aggregat
 
 Autoplay runs on the Reconciliation page, not as a background service. Pause it or let it finish before navigating away. Program, exception, batch, and audit state remain persisted in SQLite.
 
-## Exceptions and restriction
+## Matching, exceptions and restriction
 
 Default prototype thresholds are editable under **Configuration & service controls**.
 
@@ -135,9 +186,21 @@ Default prototype thresholds are editable under **Configuration & service contro
 
 Exceptions use exactly four statuses: `OPEN`, `INVESTIGATING`, `RESOLVED`, and `OVERRIDDEN`.
 
+`OPEN` and `INVESTIGATING` are unresolved states: their amounts contribute to exposure and their resolution deadlines continue to run. `RESOLVED` and `OVERRIDDEN` are terminal states and no longer contribute to unresolved exposure. Reducing exposure does not automatically lift an existing restriction; the restriction remains latched until Management resumes service with a rationale.
+
 Matching is two-way and uses the same configured grace period in both directions. All pending intermediary events with the same Synapse reference are treated as one group and compared with one bank transaction carrying that reference. A successful group match updates every affected customer's expected balance; a failed group creates one exception rather than one exception per event. Intermediary-first pending state is stored on the processed events. Bank-first pending state is derived from the posted bank transaction and the absence of corresponding events, so no separate pending-match table is required.
 
-Heartbeat monitoring does not reconcile stale data. It prevents a silent or unavailable intermediary feed from being mistaken for a successfully reconciled period. Previously completed matches remain visible, but the current real-time control is not reliable again until the feed resumes.
+The matcher also handles these arrival-order edge cases:
+
+- A bank transaction may arrive first. If an exact event group arrives before the grace period expires, it matches normally.
+- If a `MISSING_INTERMEDIARY_EVENT` exception has already been created, a late exact event group updates the affected customer balances and resolves that exception.
+- An event arriving after its reference has already matched is not applied to customer balances and does not change the FBO balance. It is marked `CONFIRMED_EXCEPTION`, creates an `AMOUNT_MISMATCH`, and writes `REFERENCE_REUSED_AFTER_MATCH` evidence while preserving the original match.
+- An event group whose total is below the bank amount remains pending until another same-reference event completes it or the grace period expires. A total above the bank amount is an immediate mismatch.
+- Partial customer allocation is not performed. Customer balances roll forward only when the complete pending group exactly equals the bank transaction and the program, account and direction also agree.
+
+The Exceptions page links each workflow exception to its associated Synapse event group, Evolve bank transaction and relevant audit entries. Assignment and status changes are audited. The prototype assumes an analyst has performed the required review before selecting `RESOLVED`; it does not implement a separate approval workflow or evidence-upload system.
+
+Heartbeat monitoring does not reconcile stale data. It prevents a silent or unavailable intermediary feed from being mistaken for a successfully reconciled period. Previously completed matches remain visible. A new heartbeat restores the health indicator, but any `STALE_FEED` or `FEED_FAILURE` exception remains unresolved until it is reviewed and changed to `RESOLVED` or `OVERRIDDEN`.
 
 To avoid double-counting the same underlying discrepancy, EOD aggregate mismatch exposure is not added to transaction-exception exposure. The risk display uses the greater applicable control amount.
 
@@ -177,7 +240,7 @@ Restriction is decided by the daily risk checkpoint: either a scheduled `DAILY_C
 
 Each checkpoint run is stored in the `daily_checkpoints` table and written to the audit log with every rule's value, limit and outcome. If automatic restriction is turned off, the checkpoint still records which rules were breached but does not restrict.
 
-A critical feed failure (no heartbeat for five scenario minutes) still restricts immediately, because the bank cannot monitor the program at all without the feed.
+A critical feed failure (no heartbeat for five scenario minutes) is evaluated immediately rather than waiting for the daily checkpoint, because the bank cannot monitor the program without the feed. It restricts immediately only when automatic restriction is enabled. If that toggle is off, the Critical `FEED_FAILURE` exception and audit evidence are still created without restricting the program.
 
 Once restricted, new middleware events are `BLOCKED_BY_RESTRICTION` and their bank postings are `REJECTED_BY_RESTRICTION`; neither changes the FBO or expected balances. Management is the only prototype role that can resume service. Resumption requires a rationale and changes every unresolved `OPEN` or `INVESTIGATING` exception to `OVERRIDDEN`. Those terminal exceptions stop contributing to unresolved exposure. The action and rationale are written to the audit log.
 
@@ -191,11 +254,11 @@ To let deadlines pass during a demo, **Advance clock 4 hours** and **Advance clo
 4. **Scenario 2 · Risk levels.** Play it, then open **Exception management**. Show the Low, Medium and Critical exceptions side by side, their colours, and their different deadlines (3 days, 1 day, 4 hours). Note the program is `HIGH_RISK` but not restricted.
 5. **Investigation.** Assign the Critical exception and move it to `INVESTIGATING`. Point out the deadline keeps running.
 6. **Scenario 3 · Missed resolution deadline.** Use **Next event / deadline** and stop at each clock jump to show the time remaining fall to 1h 5m, 5m and then OVERDUE. The program is still not locked, because restriction is only decided at the daily checkpoint.
-7. **Scenario 4 · Lockdown.** Select **Start**. Playback pauses at 17:00 when the checkpoint restricts the program. Show the restriction banner and the checkpoint rules. Select **Resume** to show the `$125` transfer blocked and Evolve's posting rejected.
+7. **Scenario 4 · Lockdown.** Select **Start**. Playback pauses at 17:00 when the checkpoint restricts the program. Show the restriction banner and the checkpoint rules. Select **Resume** in the playback controls to show the `$125` transfer blocked and Evolve's posting rejected; this does not lift the restriction.
 8. **Resumption.** On **Configuration & service controls**, switch to Management and resume service with a rationale to show the override evidence.
 9. If time permits, use **Scenario 5 · Timing difference** for grace-period protection or **Scenario 6 · Synapse feed failure** for the immediate feed-failure restriction.
 
-## Simulated inputs and limitations
+## Limitations
 
 - **Simulated inputs.** The scenario feeds (`data/scenarios`), bank postings (`data/bank_transactions.csv`) and EOD batches (`data/batches`) are synthetic CSVs. The customer-transfer simulator creates the Synapse event and the bank posting itself. Nothing connects to a real bank, payment rail or Synapse system.
 - **Configurable policies.** Grace period, heartbeat timeouts, risk-level amount bands, resolution deadlines per level, warning and high-risk labels, checkpoint exposure and count limits, aggregate tolerance and automatic restriction are all editable and audited. Feed exceptions are levelled by type, not by a configurable band.
@@ -203,8 +266,17 @@ To let deadlines pass during a demo, **Advance clock 4 hours** and **Advance clo
 - **Checkpoint timing.** The daily checkpoint runs when a scenario reaches a `DAILY_CHECKPOINT` row or when a user selects it. There is no real scheduler.
 - **One program.** The prototype monitors one fintech program and one FBO account.
 - **Not authentication.** The acting-role selector records who did what; it is not a login or a complete authorization system.
+- **Grouped-reference completeness.** Many-to-one matching assumes that an exact event total represents the complete group. A production integration should also require an expected event count, sequence/checksum, settlement manifest or explicit group-complete marker.
+- **Simplified payment lifecycle.** Returns, reversals, chargebacks, fees, partial corrections, revised events and mixed-direction settlement groups are not modelled. A production system would require a controlled adjustment workflow.
+- **Prototype storage.** SQLite is suitable for a single-presenter demonstration, not concurrent production processing. Streamlit Community Cloud visitors share one database, and hosted filesystem state may be reset.
+- **Audit assurance.** The application writes an audit trail, but SQLite is not tamper-evident or write-once storage. Production evidence would need stronger access controls, retention and integrity protection.
+- **Data and integration security.** The prototype uses synthetic records and does not implement source authentication, encryption/key management, idempotency controls, KYC/AML screening, privacy workflows or a customer UUID-to-identity store.
+- **Numerical precision.** Demo amounts use SQLite/Python floating-point values. Production financial calculations should use integer minor units or fixed-precision decimals.
+- **Verification scope.** This repository is a technology demonstrator and does not include a production assurance, load, security or automated regression suite.
 
-## Roles in this prototype
+## Roles and screens
+
+### Roles in this prototype
 
 The acting-role selector contains exactly three roles:
 
@@ -214,7 +286,7 @@ The acting-role selector contains exactly three roles:
 
 Exceptions are assigned to named synthetic staff members—Maya Chen (Reconciliation Analyst), Jordan Lee (Operations), Priya Shah (Risk / Compliance), or Elena Ruiz (Management)—so ownership identifies one accountable person rather than an entire function. These names are illustrative and do not represent real employees. There is no separate Auditor role in the current UI. Apart from Management-only service resumption, the acting-role selector primarily records who performed an action in the audit trail; it is not authentication or a complete authorization system.
 
-## Screens
+### Screens
 
 - **Dashboard** — FBO balance, real-time bank-calculated expected balances, latest Synapse batch state, bank transaction feed, blocked evidence, feed health, risk metrics, exceptions by risk level, and the last daily checkpoint.
 - **Reconciliation** — scenario playback, customer-transfer simulator, real-time matching, pending/blocked evidence, expected balances, bank transactions, EOD batch receipt, customer comparison, aggregate reconciliation, clock controls and the daily risk checkpoint.
@@ -242,6 +314,7 @@ LedgerWatch/
 |-- data/ledgerwatch.db            Generated runtime SQLite state
 |-- requirements.txt               Runtime dependencies
 |-- .streamlit/config.toml         Application theme
+|-- .devcontainer/                 Optional GitHub Codespaces environment
 |-- .venv/                         Local environment; excluded from version control
 ```
 

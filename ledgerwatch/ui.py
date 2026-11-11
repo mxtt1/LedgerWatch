@@ -21,11 +21,8 @@ def configure_page(title: str, icon: str = "◉") -> str:
         role = st.selectbox("Acting role", ["Operations", "Risk / Compliance", "Management"], key="active_role")
         st.divider()
         program = row("SELECT program_name, status FROM programs WHERE program_id='PROG-001'")
-        st.caption("MONITORED PROGRAM")
         st.markdown(f"**{program['program_name']}**")
         st.markdown(status_badge(program["status"]), unsafe_allow_html=True)
-        st.divider()
-        st.caption("Evolve and Synapse are case-study names. All customers, accounts and values are synthetic; no banking rails are connected.")
     return role
 
 
@@ -106,10 +103,9 @@ def inject_css() -> None:
     )
 
 
-def page_header(eyebrow: str, title: str, description: str) -> None:
+def page_header(eyebrow: str, title: str) -> None:
     st.markdown(f'<div class="eyebrow">{eyebrow}</div>', unsafe_allow_html=True)
     st.title(title)
-    st.caption(description)
 
 
 def status_badge(status: str) -> str:
